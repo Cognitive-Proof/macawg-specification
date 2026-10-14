@@ -1,0 +1,1133 @@
+= Macawg: Identity Assertion Request Protocol
+:doctype: book
+:toc: left
+:toclevels: 3
+:sectnums:
+:sectnumlevels: 4
+:sectanchors:
+:icons: font
+:source-highlighter: rouge
+:revnumber: 0.2-draft
+:revdate: 2026-10-14
+:cawg-ia: https://cawg.io/identity/1.2/
+:c2pa-spec: https://c2pa.org/specifications/specifications/2.2/specs/C2PA_Specification.html
+
+[abstract]
+== Abstract
+
+This document defines Macawg, a protocol that lets a C2PA claim generator obtain an identity assertion `signature` from a credential holder's wallet.
+The claim generator builds a request that contains the CAWG `signer_payload` and the identities it wants, signs the request with its C2PA signing certificate, and offers it to the wallet through an invite URI, normally shown as a QR code.
+The wallet verifies the request, obtains a signature (for identity claims aggregation, from a third-party issuer), and returns it.
+The claim generator verifies the response before it places the signature in the identity assertion.
+
+Macawg is a companion to the {cawg-ia}[CAWG Identity Assertion specification, version 1.2].
+That specification defines the assertion and its signature types.
+This document defines how the signature travels between the two parties.
+
+[NOTE]
+.Status of this document
+====
+This is a draft, not a CAWG work product.
+The Rust crate https://github.com/Cognitive-Proof/macawg[`macawg`] 0.1.0 is its reference implementation.
+Each normative rule either traces to that crate or is marked *(proposed)*.
+A proposed rule is part of the intended protocol, but the reference implementation does not enforce it yet.
+Where this document names a crate function, the name is informative.
+====
+
+== Introduction
+
+=== Scope
+
+The CAWG Identity Assertion specification (§6.1) requires that the `signer_payload` "MUST be presented to be signed by the credential holder", and §8.1 says that an identity claims aggregator issues the credential that becomes the `signature` value.
+It does not say how the payload reaches the credential holder or how the signature comes back.
+Each implementation must therefore invent its own exchange, and wallets and devices from different vendors cannot work together.
+
+This document fills that gap for the case where the identity assertion generator and the credential holder are on different devices.
+For example, the generator might be a camera and the holder a person's phone.
+It specifies:
+
+* an invite URI that carries a session id, a nonce, and a transport hint (<<invite>>);
+* a request format that carries the `signer_payload` and the identities the generator asks for (<<request>>);
+* authentication of the request with the generator's C2PA signing credential (<<request-auth>>);
+* the checks a wallet makes before signing (<<wallet-validation>>);
+* the unsigned ICA credential a wallet hands to an issuer (<<ica>>);
+* a response format and the checks the generator makes on it (<<response>>, <<device-validation>>);
+* transport bindings (<<transport>>).
+
+The following are out of scope:
+
+* the identity assertion itself, its CBOR encoding, and how a validator checks it ({cawg-ia}[CAWG Identity Assertion] §5–§8);
+* how an identity claims aggregator verifies a person's identities (for example, through OAuth);
+* the API between a wallet and an identity claims aggregator (<<issuer-api>> gives informative guidance only);
+* rendering of QR codes and the user interface of the wallet.
+
+=== Conceptual overview
+
+[source]
+----
+claim generator                     wallet                         ICA issuer
+───────────────                     ──────                         ──────────
+build request (signer_payload,
+  requested identities)
+sign request (C2PA cert, COSE)
+show invite  ──── QR: macawg:// ──▶ parse invite
+             ◀─── GET request ───── verify request     
+                                    ask the person
+                                    build unsigned credential ───▶ verify identities
+                                                                   issue COSE_Sign1
+             ◀─── POST response ─── build response         ◀────── signature
+verify response
+signature → cawg.identity assertion
+----
+
+The flow has three properties:
+
+. The person scans a code, normally shown by the device.
+The nonce in that code ties the request the wallet fetches, and the response the device receives, to possession of that invitation.
+Possession of an invitation does not prove physical proximity to the device (<<relay>>).
+. The request is signed with the same credential the generator uses to sign the C2PA claim.
+A wallet can therefore tell the person which C2PA signer is asking, and check that signer against the C2PA trust list.
+. For `cawg.identity_claims_aggregation`, the wallet does not sign.
+A third-party issuer that has verified the identities signs the credential.
+The `c2paAsset` in that credential binds it to the assertions that the `signer_payload` references, including the claim's hard binding (<<binding-scope>>).
+
+== Normative references
+
+* [[[CAWG-IA]]] Creator Assertions Working Group, _Identity Assertion_, version 1.2. {cawg-ia}
+* [[[C2PA]]] C2PA, _C2PA Technical Specification_, version 2.2. {c2pa-spec}
+* [[[RFC2119]]] Bradner, S., _Key words for use in RFCs to Indicate Requirement Levels_, BCP 14, RFC 2119.
+* [[[RFC8174]]] Leiba, B., _Ambiguity of Uppercase vs Lowercase in RFC 2119 Key Words_, BCP 14, RFC 8174.
+* [[[RFC9052]]] Schaad, J., _CBOR Object Signing and Encryption (COSE): Structures and Process_, RFC 9052.
+* [[[RFC9360]]] Schaad, J., _CBOR Object Signing and Encryption (COSE): Header Parameters for Carrying and Referencing X.509 Certificates_, RFC 9360.
+* [[[RFC3986]]] Berners-Lee, T., et al., _Uniform Resource Identifier (URI): Generic Syntax_, RFC 3986.
+* [[[RFC4648]]] Josefsson, S., _The Base16, Base32, and Base64 Data Encodings_, RFC 4648.
+* [[[RFC3339]]] Klyne, G. and C. Newman, _Date and Time on the Internet: Timestamps_, RFC 3339.
+* [[[RFC8259]]] Bray, T., _The JavaScript Object Notation (JSON) Data Interchange Format_, RFC 8259.
+* [[[RFC9110]]] Fielding, R., et al., _HTTP Semantics_, RFC 9110.
+* [[[VC-DATA-MODEL-2.0]]] W3C, _Verifiable Credentials Data Model v2.0_.
+* [[[DID-JWK]]] _did:jwk Method Specification_. https://github.com/quartzjer/did-jwk
+
+== Terms and definitions
+
+=== Concepts adapted from the CAWG Identity Assertion specification
+
+==== Identity assertion generator
+
+The actor that builds the identity assertion and places it in a C2PA claim.
+In this document, the identity assertion generator is also the C2PA claim generator, and is called the *device*.
+
+Adapted from <<CAWG-IA>> §3.
+
+==== Credential holder
+
+The person, and the software acting for them, that controls the credential used to sign the `signer_payload`.
+In this document, the software is called the *wallet*.
+
+Adapted from <<CAWG-IA>> §3.
+
+==== Identity claims aggregator
+
+A third party that verifies a person's identities and issues an `IdentityClaimsAggregationCredential` that names them.
+In this document, it is called the *ICA issuer*.
+
+Adapted from <<CAWG-IA>> §8.1.
+
+==== Signer payload
+
+The `signer_payload` data structure defined in <<CAWG-IA>> §5.2.
+In this document, it means the payload the device computed for one claim.
+
+=== Terms defined by this document
+
+==== Session
+
+One run of the protocol, from showing an invite to accepting or rejecting a response.
+A session is named by a session id and secured by a nonce.
+
+==== Invite
+
+A URI with the `macawg` scheme that tells the wallet how to reach a session (<<invite>>).
+
+==== Sign request
+
+The JSON object, of type `macawg.sign_request`, that describes what the device asks the wallet to sign (<<request>>).
+
+==== Request envelope
+
+The sign request bytes together with a detached `COSE_Sign1` over them (<<request-auth>>).
+
+==== Sign response
+
+The JSON object, of type `macawg.sign_response`, that carries the wallet's signature or its refusal (<<response>>).
+
+==== Unsigned ICA credential
+
+The information a wallet gives an ICA issuer so that the issuer can produce a credential for one request (<<ica>>).
+
+==== Requester
+
+The holder of the C2PA signing certificate that signed a request envelope.
+
+=== Data encodings
+
+base64url::
+Base64 with the URL and filename safe alphabet, without padding (<<RFC4648>> §5).
+Unless this document says otherwise, binary values in JSON are base64url strings.
+Receivers SHOULD also accept padded base64url and standard base64 (<<RFC4648>> §4).
+_(Traces to `Base64Bytes`.)_
+
+Timestamp::
+A JSON string in the format of <<RFC3339>>, in UTC.
+
+== Standard terms
+
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 <<RFC2119>> <<RFC8174>> when, and only when, they appear in all capitals, as shown here.
+
+A rule marked *(proposed)* is normative for this draft, but the reference implementation does not yet enforce it.
+This includes rules about user interface, deployment policy and session state, which a stateless library cannot enforce and which the application that embeds it must carry out.
+
+== Actors and protocol version
+
+=== Actors
+
+Device::
+The C2PA claim generator, which is also the identity assertion generator.
+It holds a C2PA signing credential: an X.509 certificate chain that meets the C2PA certificate profile, and its private key.
+It computes the `signer_payload`, starts the session, and puts the returned signature into the identity assertion.
+
+Wallet::
+Software that acts for the credential holder.
+It reads the invite, verifies the request, shows the request to the person, and returns a response.
+For `cawg.x509.cose`, the wallet holds the person's X.509 credential and signs.
+For `cawg.identity_claims_aggregation`, the wallet holds the person's verified identities, or references to them, and obtains the credential from an ICA issuer.
+
+ICA issuer::
+An identity claims aggregator.
+It signs `IdentityClaimsAggregationCredential` credentials with an Ed25519 key named by a DID.
+
+=== Protocol version
+
+This document defines protocol version `1`.
+The invite, the sign request, and the sign response each carry the version.
+A receiver MUST reject a message whose version it does not support.
+_(Traces to `Invite::parse`, `check_request`, `check_response`.)_
+
+=== Signature types
+
+A session asks for exactly one of these `sig_type` values, defined in <<CAWG-IA>> §8:
+
+* `cawg.identity_claims_aggregation` (§8.1);
+* `cawg.x509.cose` (§8.2).
+
+A wallet MUST reject a request for any other `sig_type`.
+_(Traces to `check_request`.)_
+
+[[invite]]
+== Invite URI
+
+=== Syntax
+
+An invite is an absolute URI <<RFC3986>> with the scheme `macawg` and the authority `sign`.
+Its parameters are carried in the query component:
+
+[source]
+----
+macawg://sign?v=1&sid=<session id>&n=<nonce>&t=https&u=<session URL>
+macawg://sign?v=1&sid=<session id>&n=<nonce>&t=ble&svc=<service UUID>[&name=<local name>]
+----
+
+[cols="1,1,4",options="header"]
+|===
+|Parameter |Presence |Meaning
+
+|`v` |REQUIRED |Protocol version, a decimal integer. `1` for this document.
+|`sid` |REQUIRED |Session id.
+|`n` |REQUIRED |Session nonce.
+|`t` |REQUIRED |Transport: `https` or `ble`.
+|`u` |REQUIRED when `t=https` |The session URL (<<transport-https>>).
+|`svc` |REQUIRED when `t=ble` |BLE GATT service UUID (<<transport-ble>>).
+|`name` |OPTIONAL, `t=ble` only |BLE local name, to help the wallet pick a peripheral.
+|===
+
+Parameter values MUST be percent-encoded as `application/x-www-form-urlencoded` query values.
+_(Traces to `Invite::to_uri`.)_
+
+=== Session id and nonce
+
+*(proposed)* The device MUST generate a fresh session id and a fresh nonce for each session.
+The nonce MUST be unpredictable to anyone who has not seen the invite.
+
+*(proposed)* The nonce MUST contain at least 128 bits of entropy from a cryptographically secure random number generator, and SHOULD be encoded as base64url.
+The reference implementation provides `random_token(16)`, which meets this requirement, but it does not enforce a minimum for nonces that applications supply.
+
+=== Parsing
+
+A wallet parsing an invite:
+
+. MUST reject a URI whose scheme is not `macawg`.
+. MUST reject an invite that is missing `v`, `sid`, `n` or `t`, or is missing the parameters that its transport requires.
+. MUST reject an invite whose `v` it does not support.
+. MUST reject an invite whose `t` it does not support.
+. For `t=https`, MUST reject a `u` that is not an `http` or `https` URL.
+
+_(Traces to `Invite::parse`.)_
+
+*(proposed)* Outside of development, a wallet MUST reject a `u` whose scheme is `http`.
+The reference implementation accepts `http` so that devices on a local network can be tested without TLS certificates.
+
+A wallet MUST NOT treat a parsed invite as evidence of who the requester is.
+Anyone can show a QR code.
+The requester is established only by <<request-auth>>.
+
+[[request]]
+== Sign request
+
+=== Structure
+
+A sign request is a JSON object <<RFC8259>> with these members:
+
+[cols="2,1,5",options="header"]
+|===
+|Member |Presence |Meaning
+
+|`type` |REQUIRED |The string `macawg.sign_request`.
+|`version` |REQUIRED |The protocol version, `1`.
+|`session_id` |REQUIRED |MUST equal the invite's `sid`.
+|`session_url` |REQUIRED for HTTPS, *(proposed)* |The session URL. MUST equal the invite's `u` (<<transport-https>>).
+|`nonce` |REQUIRED |MUST equal the invite's `n`.
+|`issued_at` |REQUIRED |Timestamp when the device created the request.
+|`expires_at` |REQUIRED |Timestamp after which the request MUST NOT be signed.
+|`signer_payload` |REQUIRED |The signer payload to sign (<<wire-signer-payload>>).
+|`max_signature_size` |REQUIRED |The number of bytes the device reserved for the identity assertion's `signature` field. A positive integer.
+|`requested` |OPTIONAL |The identities the device asks for (<<requested>>). Absent means the wallet chooses.
+|`context` |OPTIONAL |Descriptive information for display (<<request-context>>).
+|===
+
+Receivers MUST ignore members they do not recognise at the top level of the request and in `context`.
+These members are descriptive or advisory, and ignoring them does not weaken what is signed.
+_(Traces to the serde definitions, which do not deny unknown fields.)_
+
+*(proposed)* A receiver MUST reject a request whose `signer_payload` contains a member it does not recognise, and MUST NOT remove such a member.
+Members of `signer_payload` restrict what the identity signature means.
+A receiver that dropped one would either sign a weaker statement than the device asked for, or return a payload that fails the device's equality check.
+The reference implementation currently drops unknown `signer_payload` members.
+
+Version 1 defines no extension mechanism for security-relevant members.
+A later version will need either a new protocol version or a list of critical extensions before it adds one.
+
+[[wire-signer-payload]]
+=== `signer_payload`
+
+The `signer_payload` member is the JSON form of the CBOR `signer_payload` map in <<CAWG-IA>> §5.2:
+
+[cols="2,1,5",options="header"]
+|===
+|Member |Presence |Meaning
+
+|`referenced_assertions` |REQUIRED |Array of hashed URIs. Each has `url` (string), `alg` (string, OPTIONAL), and `hash` (base64url).
+|`sig_type` |REQUIRED |One of the values in <<_signature_types>>.
+|`role` |OPTIONAL |Array of role strings. Omitted when empty.
+|`expected_partial_claim` |OPTIONAL, *(proposed)* |As in <<CAWG-IA>> §6.1.1, with `hash` as base64url.
+|`expected_claim_generator` |OPTIONAL, *(proposed)* |As in <<CAWG-IA>> §6.1.2, with `hash` as base64url. See <<expected-claim-generator>>.
+|`expected_countersigners` |OPTIONAL, *(proposed)* |As in <<CAWG-IA>> §6.1.3.
+|===
+
+The device MUST produce `signer_payload` from the same payload that it will place in the identity assertion, so that converting it back to CBOR yields the same map.
+_(Traces to `WireSignerPayload` and its `From` conversions.)_
+
+The `referenced_assertions` MUST include the claim's hard binding assertion, as <<CAWG-IA>> §5.2 requires.
+A wallet MUST reject a request in which no entry's URL has a last path segment that begins with `c2pa.hash.`.
+_(Traces to `WireSignerPayload::has_hard_binding`.)_
+
+This check is syntactic.
+It catches a device that forgot the hard binding, but the wallet cannot see the claim, so it cannot confirm that the reference names a valid, active hard binding assertion.
+Validators of the asset make that check (<<CAWG-IA>> §7).
+
+NOTE: The reference implementation does not yet carry the `expected_*` members.
+c2pa-rs 0.91, whose `SignerPayload` it mirrors, does not model them either.
+A version-1 receiver that does not know these members ignores them, and so loses them.
+This is why <<expected-claim-generator>> is proposed and not required.
+
+[[requested]]
+=== `requested`
+
+The `requested` member says which identities the device wants in an ICA credential.
+It MUST be absent unless `signer_payload.sig_type` is `cawg.identity_claims_aggregation`.
+_(Traces to `seal::validate`.)_
+
+[cols="2,1,5",options="header"]
+|===
+|Member |Presence |Meaning
+
+|`identities` |REQUIRED |Array of identity requests.
+|`accepted_issuers` |OPTIONAL |Array of DIDs, without fragments, of the ICA issuers the device accepts. Absent or empty means any issuer.
+|===
+
+Each identity request has these members:
+
+[cols="2,1,5",options="header"]
+|===
+|Member |Presence |Meaning
+
+|`type` |REQUIRED |A `verifiedIdentities[].type` value from <<CAWG-IA>> §8.1: `cawg.document_verification`, `cawg.web_site`, `cawg.affiliation`, `cawg.social_media`, or `cawg.crypto_wallet`.
+|`required` |OPTIONAL |Boolean, default `false`. When `true`, a response without an identity of this type MUST be rejected.
+|`fields` |REQUIRED |Array of field names to disclose: any of `name`, `username`, `address`, `uri`.
+|`providers` |OPTIONAL |Array of accepted `provider.id` URIs. Absent or empty means any provider.
+|`purpose` |OPTIONAL |Text that explains to the person why the device asks.
+|===
+
+A `requested` member is well-formed only if all of these hold:
+
+. Every `type` is one of the five values above.
+. No `type` appears in more than one identity request.
+. `fields` includes the mandatory field for the type shown in <<mandatory-fields>>.
+
+The device MUST NOT send a request with a malformed `requested`, and a wallet MUST reject one.
+_(Traces to `Requested::validate`, called from `seal_request` and `open_request`.)_
+
+[[mandatory-fields]]
+.Mandatory field per identity type
+[cols="2,1,2",options="header"]
+|===
+|Type |Mandatory field |Source
+|`cawg.document_verification` |`name` |<<CAWG-IA>> §8.1
+|`cawg.affiliation` |`name` |Macawg restriction
+|`cawg.social_media` |`username` |<<CAWG-IA>> §8.1
+|`cawg.crypto_wallet` |`address` |<<CAWG-IA>> §8.1
+|`cawg.web_site` |`uri` |<<CAWG-IA>> §8.1
+|===
+
+<<CAWG-IA>> does not require `name` for `cawg.affiliation`.
+Macawg requires it so that an affiliation is never disclosed without saying what it is an affiliation with.
+_(Traces to `IdentityField::mandatory_for`.)_
+
+[[selective-disclosure]]
+==== Matching identities to a request
+
+A list of verified identities _answers_ a `requested` member when all of these hold:
+
+. The type of every identity appears in `requested.identities`.
+. Each type appears at most once.
+. For each identity, every field in its request's `fields` is present and non-empty.
+. For each identity, no field outside its request's `fields` is present.
+. If the identity request has a non-empty `providers`, the identity's `provider.id` is in it.
+. Every identity request with `required: true` has a matching identity.
+
+_(Traces to `Requested::check`.)_
+
+Rule 4 is deliberate.
+The wallet discloses exactly the fields the device asked for, and no more.
+A device that wants a field must ask for it.
+
+[[request-context]]
+=== `context`
+
+The `context` member describes the content for display to the person.
+It is covered by the request signature, but it is descriptive: the binding to the content is the `signer_payload`.
+All members are OPTIONAL.
+
+[cols="2,5",options="header"]
+|===
+|Member |Meaning
+|`claim_generator` |Name of the claim generator.
+|`title` |Title of the asset.
+|`format` |Media type of the asset.
+|`thumbnail` |Object with `format` (media type) and `data` (base64url).
+|`assertions` |Array of objects with `label` and an OPTIONAL `summary`, which describe the referenced assertions.
+|`message` |Free text for the person.
+|===
+
+A wallet MUST NOT rely on `context` for any security decision.
+_(No check in the reference implementation reads `context`.)_
+
+The request signature shows which requester supplied the `context`.
+It does not show that a thumbnail or title depicts the content that the `signer_payload` hashes identify.
+A wallet SHOULD present `context` as the requester's description, not as a verified view of the content.
+
+=== Example
+
+[source,json]
+----
+{
+  "type": "macawg.sign_request",
+  "version": 1,
+  "session_id": "q2b9Yv0rN4kM1pQyHk3ZtA",
+  "session_url": "https://camera.example/s/q2b9Yv0rN4kM1pQyHk3ZtA",
+  "nonce": "8m2cR0xV7JpLwE5uT1aGsQ",
+  "issued_at": "2026-10-14T09:30:00Z",
+  "expires_at": "2026-10-14T09:35:00Z",
+  "signer_payload": {
+    "referenced_assertions": [
+      {
+        "url": "self#jumbf=c2pa.assertions/c2pa.hash.data",
+        "hash": "U3Rhbm..."
+      }
+    ],
+    "sig_type": "cawg.identity_claims_aggregation",
+    "role": ["cawg.creator"]
+  },
+  "max_signature_size": 8192,
+  "requested": {
+    "identities": [
+      {
+        "type": "cawg.social_media",
+        "required": true,
+        "fields": ["username", "uri"],
+        "purpose": "Credit the photographer"
+      }
+    ],
+    "accepted_issuers": ["did:jwk:eyJrdHkiOiJPS1AiLC..."]
+  },
+  "context": { "title": "IMG_0042.jpg", "format": "image/jpeg" }
+}
+----
+
+[[expected-claim-generator]]
+=== `expected_claim_generator` binding *(proposed)*
+
+<<CAWG-IA>> §6.1.2 lets a `signer_payload` name the claim generator's end-entity certificate through `expected_claim_generator`.
+In Macawg, the device that signs the request is the claim generator, and it signs with the same certificate.
+This gives the wallet a check that the request signer is the party that will sign the claim.
+
+*(proposed)* A device MUST include `expected_claim_generator` in `signer_payload`, computed over the end-entity certificate of its C2PA signing credential as <<CAWG-IA>> §6.1.2 describes.
+
+*(proposed)* A wallet MUST compute the same value over the end-entity certificate in the request's `x5chain` (<<request-auth>>), and MUST reject the request if `expected_claim_generator` is absent or does not match.
+
+Without this check, a party that holds any C2PA certificate could sign a request whose `signer_payload` was computed by a different claim generator.
+The person would see one requester's name, while their identity would be attached to another party's claim.
+With this check, the identity assertion is also bound to the claim generator's certificate, so it cannot be moved to a claim signed with a different certificate.
+It still does not bind unreferenced parts of the claim.
+That needs `expected_partial_claim` (<<binding-scope>>).
+
+This rule needs the `expected_*` members to be carried in <<wire-signer-payload>>, and needs claim generators to compute them.
+Neither is implemented in the reference implementation or in c2pa-rs 0.91.
+
+[[request-auth]]
+== Request authentication
+
+=== Request envelope
+
+The device MUST sign each request with its C2PA signing credential, the same credential that it uses to sign the C2PA claim.
+The wallet fetches a request envelope, a JSON object with these members:
+
+[cols="2,1,5",options="header"]
+|===
+|Member |Presence |Meaning
+|`request` |REQUIRED |base64url of the UTF-8 JSON bytes of the sign request, exactly as signed.
+|`cose_sign1` |REQUIRED |base64url of a tagged `COSE_Sign1` <<RFC9052>> with a detached payload.
+|===
+
+The wallet MUST verify the signature over the decoded `request` bytes, and MUST parse the request from those same bytes.
+It MUST NOT re-serialise the request before verifying it.
+_(Traces to `RequestEnvelope`, `open_request`.)_
+
+=== `COSE_Sign1` construction
+
+The device MUST construct the `COSE_Sign1` as follows:
+
+. The protected header MUST contain:
+.. `alg` (label 1): the COSE algorithm of the signing key. One of ES256, ES384, ES512, PS256, PS384, PS512, or EdDSA (Ed25519), as allowed by <<C2PA>> for claim signatures.
+.. `content type` (label 3): the text string `application/vnd.macawg.sign-request+json`.
+.. `x5chain` (label 33, <<RFC9360>>): the signing certificate chain, end-entity certificate first. A chain of one certificate is a single byte string. A longer chain is an array of byte strings.
+. The payload MUST be detached (`nil`).
+. The external AAD MUST be the 22 ASCII bytes `macawg.sign_request.v1`.
+. The signature is computed over the `Sig_structure` of <<RFC9052>> §4.4 with context `"Signature1"`, the protected header, the external AAD above, and the request bytes as payload.
+
+_(Traces to `seal_request`, `REQUEST_AAD`, `REQUEST_CONTENT_TYPE`.)_
+
+The external AAD separates request signatures from every other use of the C2PA credential.
+A request signature cannot be presented as a C2PA claim signature, nor the reverse.
+
+=== Nonce binding
+
+The request carries the session id and nonce from the invite, and both are under the device's signature.
+The wallet MUST check that they equal the values in the invite it scanned (<<wallet-validation>>).
+
+This proves that the request was signed for the session named in the invite the person scanned.
+A request captured from another session does not carry the right nonce.
+It does not prove that the wallet fetched the request directly from the device: an attacker can relay the device's own signed request (<<relay>>).
+
+*(proposed)* The wallet MUST also check that `session_url` equals the invite's `u`, and MUST send the response only to `session_url`.
+This stops an attacker from showing an invite that points to their own proxy, relaying the device's request through it, and collecting the response.
+
+[[trust-modes]]
+=== Requester trust
+
+A wallet MUST verify the `COSE_Sign1` and the certificate in `x5chain` with a C2PA COSE verifier.
+The end-entity certificate MUST meet the C2PA certificate profile (<<C2PA>>).
+
+*(proposed)* A production wallet MUST also validate the chain against a trust list, normally the C2PA trust list.
+A wallet MAY offer a development mode that checks the certificate profile only.
+In that mode, the wallet MUST show the person that the requester is not trusted.
+_(Traces to `TrustMode::TrustAnchors`, `TrustMode::ProfileOnly`, and `RequesterInfo::trusted`.)_
+
+The wallet SHOULD show the person the requester's certificate subject common name and issuer organisation.
+_(The values come from `RequesterInfo`.)_
+
+[[wallet-validation]]
+== Wallet validation of a request
+
+Before it asks the person to sign, a wallet MUST perform these checks on a request envelope fetched for an invite.
+It MUST reject the request if any check fails.
+
+. The `cose_sign1` is a valid `COSE_Sign1` over `request`, with the external AAD `macawg.sign_request.v1`, under the key of the end-entity certificate in `x5chain`.
+. The certificate meets the C2PA certificate profile and, in production, chains to a trust anchor (<<trust-modes>>). Any error the verifier reports is fatal.
+. `request` parses as a sign request.
+. `type` is `macawg.sign_request`.
+. `version` is supported.
+. `session_id` equals the invite's `sid`.
+. `nonce` equals the invite's `n`.
+. The current time is no later than `expires_at` plus the allowed clock skew.
+. `issued_at` is no later than the current time plus the allowed clock skew.
+. `signer_payload.sig_type` is `cawg.identity_claims_aggregation` or `cawg.x509.cose`.
+. `signer_payload.referenced_assertions` includes a hard binding assertion.
+. `max_signature_size` is greater than 0 and no more than 65536.
+. If `requested` is present, `sig_type` is `cawg.identity_claims_aggregation`, and `requested` is well-formed (<<requested>>).
+. *(proposed)* The protected header `content type` is `application/vnd.macawg.sign-request+json`.
+. *(proposed)* `expected_claim_generator` matches the `x5chain` end-entity certificate (<<expected-claim-generator>>).
+. *(proposed)* For HTTPS, `session_url` is present and equals the invite's `u`.
+. *(proposed)* `issued_at` is earlier than `expires_at`, and `expires_at` is no more than 15 minutes after `issued_at`.
+. *(proposed)* `signer_payload` contains no member the wallet does not recognise.
+. *(proposed)* The envelope and its parts are within the limits in <<resource-limits>>. The wallet MUST check the envelope size before it decodes it.
+
+_(Checks 1–13 trace to `open_request` and `check_request`.)_
+
+The allowed clock skew is 5 minutes.
+_(Traces to `CLOCK_SKEW`.)_
+Because of the skew, a wallet can accept a request up to 5 minutes after `expires_at`, so the effective acceptance window is the nominal lifetime plus 5 minutes.
+
+*(proposed)* The wallet MUST check expiry again immediately before it sends a `signed` response, and MUST NOT send one for an expired request.
+The person may take a long time to decide.
+
+A wallet MAY decode an unverified request to explain to the person why it was rejected.
+It MUST NOT offer to sign one.
+_(Traces to `RequestEnvelope::unverified_request`.)_
+
+*(proposed)* After these checks pass, the wallet SHOULD show the person the requester (<<trust-modes>>), the `context`, the roles in `signer_payload.role`, and, for each identity request, its type, fields, `required` flag, and `purpose`.
+Before the person agrees, the wallet MUST show the actual identity values that it will disclose, and MUST explain that they will be published in the asset, where anyone who reads the asset can see them.
+*(proposed)* The wallet MUST NOT send a signed response unless the person agrees.
+
+[[ica]]
+== Identity claims aggregation
+
+This section applies when `signer_payload.sig_type` is `cawg.identity_claims_aggregation`.
+
+=== Unsigned ICA credential
+
+The wallet selects the person's verified identities that answer the request, and builds an unsigned ICA credential.
+It has these members:
+
+[cols="2,1,5",options="header"]
+|===
+|Member |Presence |Meaning
+|`signer_payload` |REQUIRED |Copied unchanged from the request.
+|`verified_identities` |REQUIRED |A non-empty array of `verifiedIdentities` entries (<<CAWG-IA>> §8.1).
+|`max_signature_size` |REQUIRED |Copied from the request.
+|`accepted_issuers` |OPTIONAL |Copied from `requested.accepted_issuers`.
+|===
+
+Each `verified_identities` entry has `type`, the OPTIONAL fields `name`, `username`, `address` and `uri`, `verifiedAt` (a timestamp), and `provider`, which is an object with `id` (a URI) and `name`.
+
+The wallet MUST NOT build an unsigned ICA credential for a request whose `sig_type` is not `cawg.identity_claims_aggregation`.
+`verified_identities` MUST NOT be empty.
+If the request has `requested`, then `verified_identities` MUST answer it (<<selective-disclosure>>).
+If the request has no `requested`, the wallet chooses which identities to include.
+_(Traces to `UnsignedIcaCredential::for_request`.)_
+
+=== Issuance
+
+An ICA issuer that receives an unsigned ICA credential:
+
+. MUST refuse if `accepted_issuers` is non-empty and does not contain the issuer's DID.
+. MUST refuse if `signer_payload.sig_type` is not `cawg.identity_claims_aggregation`, or if `verified_identities` is empty.
+. MUST check every entry of `verified_identities` against what the issuer itself has verified for the person, and MUST refuse if any entry does not match.
+The issuer vouches for every identity in the credential.
+. MUST build the credential JSON in <<ica-vc>>, with `validFrom` set to the time of issue.
+. MUST sign it as in <<ica-cose>>.
+. MUST refuse if the tagged `COSE_Sign1` is longer than `max_signature_size`.
+
+_(Rules 1, 2, 4, 5 and 6 trace to `UnsignedIcaCredential::issue`. Rule 3 is the documented precondition of `issue`. The reference implementation leaves it to the issuer service.)_
+
+[[wallet-release]]
+=== Wallet checks before release *(proposed)*
+
+The issuer, not the wallet, produces the bytes that the device receives and that the asset publishes.
+An issuer could return extra identities, different values, or other identifying information.
+The device's checks (<<device-ica>>) would reject such a credential, but only after the device has received it.
+
+*(proposed)* Before it sends a `signed` response, the wallet MUST verify the returned credential with the checks of <<device-ica>>.
+It MUST also check that `verifiedIdentities` is exactly the list the person approved, with the same values, and MUST NOT send the credential if it is not.
+_(The reference implementation provides `verify_ica_credential` for the first part, but its wallet flow does not call it. The exact-match check is not implemented.)_
+
+[[ica-vc]]
+==== Credential JSON
+
+[source,json]
+----
+{
+  "@context": [
+    "https://www.w3.org/ns/credentials/v2",
+    "https://cawg.io/identity/1.1/ica/context/"
+  ],
+  "type": ["VerifiableCredential", "IdentityClaimsAggregationCredential"],
+  "issuer": "did:jwk:...",
+  "validFrom": "2026-10-14T09:31:02Z",
+  "credentialSubject": {
+    "verifiedIdentities": [ ... ],
+    "c2paAsset": {
+      "sig_type": "cawg.identity_claims_aggregation",
+      "referenced_assertions": [
+        { "url": "...", "alg": "sha256", "hash": "<standard base64>" }
+      ],
+      "role": ["cawg.creator"]
+    }
+  }
+}
+----
+
+`c2paAsset` is the request's `signer_payload`, but its hashes are standard base64 (<<RFC4648>> §4), not base64url, as <<CAWG-IA>> §8.1 requires.
+`role` and `alg` are omitted when absent.
+_(Traces to `ica_vc_json`.)_
+
+NOTE: The `@context` URI is the version 1.1 ICA context.
+This is the URI that <<CAWG-IA>> 1.2 itself uses, and the one that c2pa-rs validators expect.
+
+[[ica-cose]]
+==== Signature
+
+The credential JSON is the embedded payload of a tagged `COSE_Sign1`.
+Its protected header has `alg` EdDSA and `content type` `application/vc`.
+The signature is Ed25519 over the `Sig_structure` with an empty external AAD.
+The tagged `COSE_Sign1` bytes are the identity assertion's `signature` value.
+_(Traces to `UnsignedIcaCredential::issue`, `ICA_CONTENT_TYPE`.)_
+
+The issuer's DID MUST be `did:jwk` or `did:web`.
+The signing key MUST be a verification method in the DID document's `assertionMethod` relationship (<<CAWG-IA>> §8.1).
+For `did:jwk`, the DID document lists the key in `assertionMethod` unless the JWK has `"use": "enc"`.
+_(Traces to `IcaIssuer::did` and the `IssuerKeyResolver` contract. *(proposed)* The reference implementation does not reject a `did:jwk` with `"use": "enc"`.)_
+
+NOTE: Implementation compatibility.
+c2pa-rs 0.91 decodes `did:jwk` with a padded base64url decoder, so it rejects the unpadded form that did:jwk requires whenever padding would be needed.
+The reference implementation works around this by adding `"alg": "EdDSA"` to the JWK, which makes the encoded JWK 93 bytes long, so it never needs padding (`did_jwk_for_ed25519`).
+This is a workaround for one validator, not a protocol requirement.
+
+[[issuer-api]]
+=== Wallet to issuer interface (informative)
+
+This document does not standardise how a wallet reaches an ICA issuer, or how the issuer authenticates the person.
+An issuer API SHOULD accept the unsigned ICA credential defined above, so that the issuer can apply the same `accepted_issuers` and size rules.
+To support <<response-proof>>, the API also needs to carry the request digest and return the issuer's response proof.
+The issuer API in the companion `macawg-wallet` repository is a draft and is not part of this specification.
+
+[[x509]]
+== X.509 signatures
+
+This section applies when `signer_payload.sig_type` is `cawg.x509.cose`.
+
+A request for this `sig_type` has no `requested` member (<<requested>>).
+
+The wallet signs the CBOR `signer_payload` with the person's X.509 credential, as <<CAWG-IA>> §8.2 specifies.
+The wallet MUST refuse to send a signature longer than `max_signature_size`.
+The wallet SHOULD verify its own signature before it sends the response.
+_(Traces to `sign_signer_payload`, `verify_identity_signature`, behind the `x509` feature.)_
+
+[[response]]
+== Sign response
+
+=== Structure
+
+The wallet answers with a sign response, a JSON object with these members:
+
+[cols="2,1,5",options="header"]
+|===
+|Member |Presence |Meaning
+|`type` |REQUIRED |The string `macawg.sign_response`.
+|`version` |REQUIRED |The protocol version, `1`.
+|`session_id` |REQUIRED |Copied from the request.
+|`nonce` |REQUIRED |Copied from the request.
+|`status` |REQUIRED |`signed` or `declined`.
+|`signer_payload` |REQUIRED when `signed` |The payload that was signed. MUST equal the request's `signer_payload`.
+|`signature` |REQUIRED when `signed` |base64url of the exact bytes for the identity assertion's `signature` field.
+|`reason` |OPTIONAL when `declined` |Text explaining the refusal.
+|`response_proof` |OPTIONAL when `signed`, *(proposed)* |base64url of a tagged `COSE_Sign1` (<<response-proof>>).
+|===
+
+_(Traces to `SignResponse`, `SignOutcome`, apart from `response_proof`.)_
+
+*(proposed)* A wallet MUST send `declined` when the person refuses.
+It SHOULD NOT put information about the person's identities in `reason`.
+
+[[response-proof]]
+=== Response proof *(proposed)*
+
+The identity signature covers the `signer_payload`, not the session.
+The response's `session_id` and `nonce` are not signed.
+If two sessions carry the same `signer_payload`, for example because the device retries after a failure, an earlier valid identity signature can be placed in a response with the new session's identifiers, and the device will accept it.
+That preserves the earlier attestation, but it does not show that anyone approved the current request.
+Single-use sessions (<<session-state>>) do not prevent this, because the reuse crosses sessions.
+
+When a device needs proof of fresh approval, it uses a response proof: a tagged `COSE_Sign1` made with the same key that made the identity signature.
+For ICA, that is the issuer's key, and the wallet passes the request digest to the issuer.
+For X.509, it is the person's key.
+
+* The payload is the CBOR map `{ "request_digest": bstr, "signature_digest": bstr }`, embedded.
+`request_digest` is the SHA-256 of the request bytes from the envelope.
+`signature_digest` is the SHA-256 of the decoded `signature`.
+* The external AAD is the ASCII bytes `macawg.sign_response.v1`.
+* The protected header's `alg` is the identity signature's algorithm.
+
+A device that requires fresh approval MUST reject a `signed` response without a valid `response_proof`.
+It MUST verify the proof with the key it used to verify the identity signature.
+A device that does not require it MAY ignore `response_proof`.
+Without the proof, an accepted response shows only that a valid identity signature exists for this `signer_payload`.
+
+The proof is not embedded in the asset, so it does not change the published credential.
+
+=== Example
+
+[source,json]
+----
+{
+  "type": "macawg.sign_response",
+  "version": 1,
+  "session_id": "q2b9Yv0rN4kM1pQyHk3ZtA",
+  "nonce": "8m2cR0xV7JpLwE5uT1aGsQ",
+  "status": "signed",
+  "signer_payload": { "referenced_assertions": [ ... ], "sig_type": "cawg.identity_claims_aggregation", "role": ["cawg.creator"] },
+  "signature": "0oRYJqIBJwN..."
+}
+----
+
+[[device-validation]]
+== Device validation of a response
+
+The device MUST perform these checks on a sign response before it uses the signature.
+It MUST reject the response if any check fails.
+
+. `type` is `macawg.sign_response`.
+. `version` is supported.
+. `session_id` and `nonce` equal those of the request the device sent.
+. *(proposed)* The request has not expired: the current time is no later than `expires_at` plus the clock skew.
+. If `status` is `declined`, the session ends without a signature.
+. `signer_payload` equals the request's `signer_payload`.
+. The decoded `signature` is no longer than `max_signature_size`.
+. The `signature` is valid for the `sig_type`: see <<device-ica>> and <<device-x509>>.
+. *(proposed)* If the device requires fresh approval, `response_proof` is valid (<<response-proof>>).
+
+_(Checks other than those marked proposed trace to `check_response`.)_
+
+[[device-ica]]
+=== ICA credential checks
+
+For `cawg.identity_claims_aggregation`, the device MUST check:
+
+. `signature` is a tagged `COSE_Sign1`, as <<CAWG-IA>> §8.1 requires. *(proposed)* The reference implementation also accepts an untagged `COSE_Sign1`, and would then embed bytes that CAWG validators reject.
+. Its protected header has `alg` EdDSA and `content type` `application/vc`.
+. The payload is embedded, and parses as credential JSON.
+. `@context` contains both `https://www.w3.org/ns/credentials/v2` and `https://cawg.io/identity/1.1/ica/context/`.
+. `type` contains both `VerifiableCredential` and `IdentityClaimsAggregationCredential`.
+. The `issuer`, with any fragment removed, is in `requested.accepted_issuers`, if that list is present and non-empty.
+. The issuer's Ed25519 key is resolved from an `assertionMethod` verification method: locally for `did:jwk`, and with a DID resolver for other methods. If the device cannot resolve the key, the check fails.
+. The Ed25519 signature verifies with an empty external AAD.
+. `validFrom` is present and no later than now plus the clock skew. `validUntil`, if present, is no earlier than now minus the clock skew. *(proposed)* <<CAWG-IA>> §8.1 requires `validFrom` for VC 2.0 credentials, but the reference implementation accepts a credential without it.
+. `credentialSubject` is a single object, or an array with exactly one element.
+. `credentialSubject.c2paAsset`, with its hashes decoded from standard base64, equals the request's `signer_payload`.
+. `verifiedIdentities` is non-empty, and, if the request has `requested`, answers it (<<selective-disclosure>>).
+
+_(Traces to `verify_ica_credential`, except where marked proposed.)_
+
+These checks repeat the issuer's checks.
+The device does not trust the wallet to have chosen the identities correctly, nor the issuer to have honoured `accepted_issuers`.
+
+[[device-x509]]
+=== X.509 signature checks
+
+For `cawg.x509.cose`, the device MUST verify the signature over its `signer_payload` as <<CAWG-IA>> §8.2 specifies, and MUST check that the signing certificate meets the certificate profile.
+The device MAY leave trust in the person's certificate to validators of the asset.
+_(Traces to `verify_identity_signature`.)_
+
+=== Use of the signature
+
+After acceptance, the device MUST place the decoded `signature` bytes, unchanged, in the identity assertion's `signature` field.
+It MUST place them in the assertion whose `signer_payload` is the request's `signer_payload`.
+_(Traces to `Accepted::signature`.)_
+
+[[session-state]]
+=== Session state *(proposed)*
+
+The reference implementation is stateless, so the application that runs the session must enforce these rules.
+
+* The device MUST accept at most one `signed` response per session.
+It MUST mark the session as finished atomically with accepting the response, so that two concurrent submissions cannot both be accepted.
+* A response that fails validation MUST NOT end the session.
+Otherwise anyone who can reach the session URL could close the session by posting garbage.
+The wallet MAY retry until the request expires.
+The device SHOULD rate-limit submissions per session.
+* A valid `declined` response ends the session.
+* The device MUST discard the session once it is finished or the request has expired.
+
+[[transport]]
+== Transport bindings
+
+[[transport-https]]
+=== HTTPS (normative)
+
+When the invite has `t=https`, the session URL `u` names one resource:
+
+* `GET u` returns the request envelope as `application/json`.
+* `POST u` with a sign response as `application/json` delivers the response.
+
+_(Traces to `TransportHint::Https`.)_
+
+*(proposed)* The wallet MUST send the response only to the request's `session_url`, which it has checked equals `u` (<<wallet-validation>>).
+
+*(proposed)* The device MUST serve the session URL over TLS, except during development (see <<invite>>).
+
+*(proposed)* The device SHOULD return HTTP 404 or 410 <<RFC9110>> for a session URL that is unknown, finished, or expired.
+*(proposed)* The device SHOULD answer a `POST` with 2xx after it accepts the response, and with 4xx after it rejects one, leaving the session open (<<session-state>>).
+
+*(proposed)* The session URL SHOULD NOT contain the nonce, because URLs end up in logs and caches.
+The request, which does contain the nonce, is protected by TLS.
+
+[[transport-ble]]
+=== Bluetooth Low Energy (placeholder)
+
+When the invite has `t=ble`, the device is a BLE peripheral that advertises the GATT service `svc`, and MAY advertise the local name `name`.
+_(Traces to `TransportHint::Ble`.)_
+
+This draft does not define the GATT characteristics, how messages are fragmented, or link security.
+A future version will define them.
+Until then, BLE is not interoperable.
+
+== Security considerations
+
+=== Requester authentication
+
+The device signs every request with its C2PA signing credential.
+The wallet verifies the signature against the C2PA trust list before it asks the person anything.
+A malicious requester can therefore get a person to sign only if that requester holds a trusted C2PA signing credential.
+A development-mode wallet (<<trust-modes>>) loses this property, and must say so.
+
+[[relay]]
+=== Binding to the invitation, and relay
+
+The nonce reaches the wallet out of band, through the camera.
+Because the device signs the nonce, an attacker cannot pass off a request from another session as the one in the invite.
+
+Scanning an invite proves possession of the invitation, not physical proximity to the device.
+Anyone who can see the code can read the nonce.
+An attacker does not need to create a signature: they can fetch the device's signed request and relay it.
+
+Two relay attacks follow:
+
+Redirected response::
+The attacker shows an invite with the real `sid` and `n`, but with `u` pointing to their own HTTPS proxy.
+The proxy relays the device's envelope, receives the identity-bearing response, and forwards it to the device.
+The attacker sees the person's disclosed identities.
+The proposed `session_url` check (<<_nonce_binding>>) prevents this: the signed request names the device's URL, and the wallet posts only there.
+The reference implementation does not have this check yet.
+
+Remote invitation::
+The attacker shows the device's genuine invite to a person who is not near the device, for example by photographing it.
+The `session_url` check does not prevent this, because every message goes to the real device.
+Macawg version 1 does not prevent it.
+Stronger proximity guarantees need an additional mechanism, such as a short-range transport or a code that the device shows only after the wallet connects.
+
+=== Replay and freshness
+
+Several mechanisms limit replay:
+
+* Requests expire (`expires_at`) and cannot be issued in the future, with a 5-minute skew allowance.
+* A response names its session by `session_id` and `nonce`, but these are not signed.
+* The identity signature covers the `signer_payload`, so it is valid only with the same referenced assertions, including the same hard binding (<<binding-scope>>).
+* *(proposed)* A session accepts at most one `signed` response (<<session-state>>).
+
+The wallet does not sign the response envelope.
+An attacker who can inject responses, and who holds an earlier valid identity signature for the same `signer_payload`, can get it accepted in a new session.
+That is a replay of an earlier approval, not proof of a new one.
+*(proposed)* Devices that need fresh approval MUST use <<response-proof>>.
+
+An attacker who can inject responses can also inject a `declined` response, which denies service but does not cause a false attribution.
+
+[[binding-scope]]
+=== What the identity signature binds
+
+The identity signature covers the `signer_payload`: the referenced assertions and their hashes, the `sig_type`, the roles, and any `expected_*` members.
+It does not, by itself, cover the rest of the claim.
+
+The required hard binding reference ties the signature to the asset's content.
+However, another claim that contains the same referenced assertions could carry the same identity assertion while it changes, adds, or removes assertions that are not referenced.
+
+* `expected_claim_generator` (<<expected-claim-generator>>) restricts which certificate can sign the claim.
+* `expected_partial_claim` (<<CAWG-IA>> §6.1.1) restricts the claim's structure, including assertions that are not referenced.
+
+Neither is implemented in version 1 (<<wire-signer-payload>>).
+*(proposed)* Until they are, a device that needs the identity bound to the whole claim MUST reference every assertion it wants covered.
+
+=== Claim generator substitution
+
+Without <<expected-claim-generator>>, the requester's certificate and the claim's signing certificate are not linked cryptographically.
+A trusted but malicious C2PA signer could relay another claim generator's `signer_payload` under its own name.
+The proposed `expected_claim_generator` rule closes this gap.
+
+=== Issuer trust
+
+The device decides which ICA issuers it trusts by setting `accepted_issuers`.
+It checks the issuer DID itself (<<device-ica>>).
+
+An empty `accepted_issuers` makes the device accept any issuer with a valid Ed25519 signature.
+Anyone can generate a `did:jwk`, assert arbitrary identity values, and pass every cryptographic check.
+A valid signature proves control of a key.
+It does not prove that anyone verified the identities.
+
+*(proposed)* A production device MUST apply an issuer trust policy: either a non-empty `accepted_issuers`, or another defined trust mechanism, such as a trust list of identity claims aggregators.
+An empty `accepted_issuers` is for development only.
+
+`provider.id` and `provider.name` are statements that the issuer vouches for.
+A familiar `provider.id` does not independently prove that the named identity provider took part.
+
+For `did:web` issuers, the security of key resolution is the security of the issuer's web origin.
+
+[[resource-limits]]
+=== Resource limits
+
+`max_signature_size` lets the device reserve space in the claim before it has the signature.
+A wallet rejects values above 64 KiB, so that a request cannot ask it to produce, and the issuer to sign, an arbitrarily large credential.
+_(Traces to `MAX_SIGNATURE_SIZE_LIMIT`.)_
+
+That limit does not bound the other inputs.
+*(proposed)* Receivers MUST enforce limits before they decode, and SHOULD use at least these:
+
+[cols="3,1",options="header"]
+|===
+|Input |Limit
+|Request envelope, as received |1 MiB
+|Decoded thumbnail |256 KiB
+|Certificates in `x5chain` |10
+|Sign response, as received |128 KiB
+|===
+
+These values are a starting point for discussion.
+
+== Privacy considerations
+
+=== Selective disclosure
+
+The `requested` member, together with rule 4 of <<selective-disclosure>>, means that a wallet discloses only the identity types, fields and providers the device asked for.
+The device checks this too, so it will not embed an over-disclosing credential.
+By then, though, the device has already seen the information, so the protection that matters is the wallet's own check before release (<<wallet-release>>).
+
+The ICA credential is a single signed document.
+Once issued, it cannot disclose less than it contains, and it is embedded in the asset, where anyone who reads the asset can see it.
+Selective disclosure therefore happens before issuance, when the wallet chooses the identities.
+The `purpose` strings help the person decide.
+
+=== Correlation
+
+Each ICA credential names one asset, so credentials for different assets are different documents.
+However, they disclose the same identity values, so they can be linked.
+This is the purpose of an identity assertion, and *(proposed)* the wallet SHOULD make it clear to the person.
+
+The ICA issuer learns the `signer_payload` hashes and the identities for every asset the person signs.
+*(proposed)* Wallets SHOULD let the person choose their issuer.
+
+=== Request contents
+
+The request `context` can contain a thumbnail of the asset.
+Anyone who can fetch the session URL can see it, so *(proposed)* the device SHOULD keep session URLs unguessable and short-lived.
+
+A `declined` response tells the device only that the person refused.
+
+[appendix]
+[[comparison]]
+== Comparison with OpenID4VP and OpenID4VCI (informative)
+
+Macawg overlaps with the OpenID for Verifiable Presentations (OpenID4VP) and OpenID for Verifiable Credential Issuance (OpenID4VCI) families.
+This appendix explains why it does not reuse them directly, and where it could converge.
+
+=== OpenID4VP and DCQL
+
+In OpenID4VP, a verifier asks a wallet to present credentials that it already holds.
+Requests can be signed (JAR, `request_uri`), can be reached by a QR code, and can use the Digital Credentials Query Language (DCQL) to ask for credential types and claims.
+
+[cols="1,2,2",options="header"]
+|===
+|Concern |OpenID4VP + DCQL |Macawg
+
+|What is returned
+|A presentation of a credential the wallet already holds, bound to the verifier by `nonce` and `aud`.
+|A new credential, issued for one C2PA claim and bound to it by `c2paAsset`.
+
+|Query
+|DCQL: credential formats, claim paths, and alternative credential sets.
+|`requested`: CAWG identity types, a fixed set of fields, providers, and issuers. Narrower, and tied to <<CAWG-IA>> §8.1.
+
+|Verifier authentication
+|Client identifier schemes such as `x509_san_dns`, `verifier_attestation`, or pre-registration.
+|The C2PA signing certificate, checked against the C2PA trust list.
+
+|Holder binding
+|Key binding proof from the holder.
+|The issuer's signature over `c2paAsset` binds the identities to the referenced assertions. The proposed `response_proof` binds the response to the request.
+
+|Transport
+|Same-device redirects, cross-device QR with `request_uri`, and the Digital Credentials API.
+|Cross-device QR with HTTPS. BLE is reserved.
+|===
+
+A future version could express `requested` as a DCQL query, with `cawg.*` types as credential types and fields as claim paths, and define a C2PA client identifier scheme.
+That would let existing OpenID4VP wallets parse the request.
+It would not remove the need for a new credential per asset, which OpenID4VP does not provide.
+
+=== OpenID4VCI
+
+In OpenID4VCI, a wallet obtains a credential from an issuer by means of a credential offer, an authorisation step, and a credential request.
+The wallet-to-ICA-issuer step of Macawg (<<issuer-api>>) has the same shape.
+The unsigned ICA credential plays the part of a credential request whose subject data includes `c2paAsset`.
+
+A natural design for the issuer API is an OpenID4VCI profile:
+
+* a credential configuration for `IdentityClaimsAggregationCredential` in COSE (`application/vc`);
+* the `c2paAsset` and the selected `verifiedIdentities` carried as credential request parameters;
+* issuer authentication of the person through the issuer's own authorisation server.
+
+This is left to a future companion document, because the draft issuer API is not yet stable.
+
+[appendix]
+== Implementation status (informative)
+
+[cols="3,1,3",options="header"]
+|===
+|Rule |Status |Reference implementation
+|Invite syntax and parsing |Implemented |`Invite::to_uri`, `Invite::parse`
+|Request structure and `requested` |Implemented |`SignRequest`, `Requested::validate`
+|Request sealing (COSE, x5chain, AAD) |Implemented |`seal_request`
+|Wallet validation, checks 1–13 |Implemented |`open_request`, `check_request`
+|Wallet check of COSE content type |Proposed |—
+|`session_url` binding |Proposed |Not in `SignRequest`
+|Reject unknown `signer_payload` members |Proposed |Unknown members are dropped
+|Request lifetime limits and expiry re-check |Proposed |Not checked
+|Resource limits |Proposed |Only `max_signature_size`
+|Wallet check of issued credential before release |Proposed |`verify_ica_credential` exists; not used in the wallet flow
+|`response_proof` |Proposed |—
+|Tagged-only ICA `COSE_Sign1` |Proposed |Untagged accepted
+|Required `validFrom` |Proposed |Optional
+|Production issuer trust policy |Proposed |Empty `accepted_issuers` accepts any issuer
+|`expected_*` members in `signer_payload` |Proposed |Not carried; c2pa-rs 0.91 does not model them
+|`expected_claim_generator` binding |Proposed |—
+|Minimum nonce entropy |Proposed |`random_token(16)` available, not enforced
+|Rejecting `http` session URLs |Proposed |`http` accepted
+|Unsigned ICA credential and issuance |Implemented |`UnsignedIcaCredential`
+|Device validation of responses |Implemented |`check_response`, `verify_ica_credential`
+|Session state and retries |Proposed |Left to the application
+|HTTPS binding |Implemented (hint only) |`TransportHint::Https`; the HTTP server is the application's
+|BLE binding |Placeholder |`TransportHint::Ble`
+|Wallet to issuer API |Out of scope |Draft in `macawg-wallet`
+|===
+
+[appendix]
+== Test vectors (to be added)
+
+A later draft will add complete test vectors.
+Each will give the request bytes, the protected header bytes, the external AAD, the `Sig_structure`, the deterministic CBOR form of `signer_payload`, and a full exchange for both `cawg.identity_claims_aggregation` and `cawg.x509.cose`.
+Until then, `tests/exchange.rs` and `tests/end_to_end.rs` in the https://github.com/Cognitive-Proof/macawg[reference implementation] are the closest equivalent.
