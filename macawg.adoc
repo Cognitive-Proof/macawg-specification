@@ -359,7 +359,7 @@ These rules apply to every binding:
 |===
 |Binding |Between |Status |Implementation
 
-|A, Macawg COSE/HTTPS (<<binding-a>>) |Device and wallet |Normative |macawg 0.2.0, except G2
+|A, Macawg COSE/HTTPS (<<binding-a>>) |Device and wallet |Normative |macawg 0.2.0; G2 dropped, because CAWG 1.3 removed `expected_claim_generator`
 |Local-key X.509 signing (<<x509>>) |Inside the wallet |Normative |macawg 0.2.0 (`x509` feature)
 |B, OpenID4VCI ICA issuance (<<binding-b>>) |Wallet and ICA issuer |Proposed |Not implemented
 |C, OpenID4VP (<<binding-c>>) |Device and wallet |Proposed, evaluation only |Not implemented
@@ -2202,8 +2202,8 @@ Rejection cases: an unknown member in the entry; a `response_uri` on a different
 [appendix]
 == Implementation status (informative)
 
-This table describes the reference implementation, `macawg` 0.2.0, at commit `d24deaf` of https://github.com/Cognitive-Proof/macawg/pull/1[Cognitive-Proof/macawg#1].
-It separates four things:
+This table describes the reference implementation, `macawg` 0.2.0, as updated for draft 0.5 in https://github.com/Cognitive-Proof/macawg/pull/1[Cognitive-Proof/macawg#1].
+It separates these categories:
 
 Library::
 The crate enforces the rule whenever the named function is used.
@@ -2213,6 +2213,8 @@ Application::
 The crate does not help; the application must implement the rule.
 Not implemented::
 No support yet.
+Dropped::
+The rule will not be implemented as written, and the specification needs to change.
 
 A helper being available does not mean that a given wallet or device calls it.
 
@@ -2243,8 +2245,8 @@ A helper being available does not mean that a given wallet or device calls it.
 |`response_proof` validation, and enforcing `response_proof_required` |Library |`check_response`
 |Not offering to sign when a required proof is unavailable |Application |`check_before_send` refuses to send a `signed` response without one
 |Issuer creates a proof only in an authorized transaction |Application |The issuer service
-|`expected_*` members in `signer_payload` |Not implemented |Rejected as unknown; c2pa-rs 0.91 does not model them. *Release blocker*
-|`expected_claim_generator` binding |Not implemented |*Release blocker*
+|Rejecting `expected_*` members in `signer_payload` |Library |`WireSignerPayload` denies them as unknown members (G4, G12)
+|`expected_claim_generator` binding (G2) |Dropped |CAWG Identity Assertion 1.3 removed `expected_partial_claim`, `expected_claim_generator` and `expected_countersigners`, and tells validators to ignore them, so an asset validator would not enforce G2. c2pa-rs 0.91 models the 1.3 `signer_payload` (contentauth/c2pa-rs#816 is open). The examples in this draft that carry `expected_claim_generator` are rejected.
 |Unsigned ICA credential and issuance |Library |`UnsignedIcaCredential`
 |Device validation of responses |Library |`check_response`, `verify_ica_credential`
 |No redirects; post only to `session_url` |Application |The wallet's HTTP client
@@ -2261,18 +2263,27 @@ A helper being available does not mean that a given wallet or device calls it.
 |Binding B (OpenID4VCI issuance) |Not implemented |—
 |Binding C (OpenID4VP) |Not implemented |—
 |Binding D (CSC `signHash`, CSC Data Model Bindings) |Not implemented |—
-|Proof AAD `macawg.sign_response.oid4vp.v1` |Not implemented |—
+|Proof AAD `macawg.sign_response.oid4vp.v1` |Not implemented |—; `tests/vectors.rs` checks that a proof made with it does not verify under binding A
+|Binding A test vectors (<<impl-tasks>> item 2) |Library |`tests/vectors.rs`
 |===
 
 [appendix]
-== Test vectors (to be added)
+== Test vectors
 
-A later draft will add complete test vectors.
-Each will give the request bytes, the protected header bytes, the external AAD, the `Sig_structure`, the deterministic CBOR form of `signer_payload`, and a full exchange for both `cawg.identity_claims_aggregation` and `cawg.x509.cose`.
-Until then, `tests/exchange.rs` and `tests/end_to_end.rs` in the https://github.com/Cognitive-Proof/macawg[reference implementation] are the closest equivalent.
+`tests/vectors.rs` in the https://github.com/Cognitive-Proof/macawg[reference implementation] holds the binding A vectors, built from this document's examples with `expected_claim_generator` removed:
 
-The vectors will include an end-to-end exchange with the proposed checks implemented, and at least these rejection cases.
-All but the redirect and `expected_claim_generator` cases are already tests in the reference implementation: `tests/exchange.rs`, and the unit tests in `src/seal.rs`, `src/ica.rs`, `src/invite.rs` and `src/request.rs`.
+* the example sign request is exactly the compact-form bytes the device signs, and its base64url hash equals the credential's standard base64 hash;
+* the request `COSE_Sign1`: tag, detached payload, empty unprotected header, the protected header bytes `{1: -8, 3: "application/vnd.macawg.sign-request+json", 33: [end-entity, CA]}`, and the `Sig_structure`, rebuilt from <<RFC9052>> §4.4 and verified with the certificate's key;
+* the ICA response with a fixed Ed25519 issuer key, which makes it deterministic: `request_digest` `f677b250d6435e6a4b4f9b7b2dc37a31fca7ff52de886bb1b27e22d422949520`, the credential's `signature_digest` `a34808a0ef04192a70f929b2d9ade91b9cdcfeaa8aeab5227b76eb713b3d45aa`, the proof payload, its protected header `a10127`, its `Sig_structure`, and the whole proof, whose SHA-256 is `134537d511c85538a379c4ac3d0b36df7b127f3c45ee52a5044e03c8b8ad895f`;
+* the X.509 response proof, checked structurally because the person's key is generated;
+* domain separation: a proof made with AAD `macawg.sign_response.oid4vp.v1` does not verify under binding A;
+* the example request with `expected_claim_generator` is rejected.
+
+A later draft may copy these values into this appendix.
+`tests/exchange.rs` and `tests/end_to_end.rs` cover full exchanges.
+
+The reference tests also cover an end-to-end exchange with the checks implemented, and these rejection cases.
+All but the redirect and `expected_claim_generator` cases are already tests in the reference implementation: `tests/exchange.rs`, `tests/vectors.rs`, and the unit tests in `src/seal.rs`, `src/ica.rs`, `src/invite.rs` and `src/request.rs`.
 Redirect handling belongs to the application's HTTP client.
 
 * a `response_proof` whose `request_digest` or `signature_digest` does not match;
@@ -2285,7 +2296,7 @@ Redirect handling belongs to the application's HTTP client.
 * an issued credential with an extra protected or unprotected COSE header parameter;
 * an issued credential with an extra `@context` or `type` entry;
 * a `session_id`, `nonce` or `reason` that breaks <<field-lengths>>;
-* a complete conforming exchange that uses `expected_claim_generator`, once it can be implemented.
+* a complete conforming exchange that uses `expected_claim_generator`. Dropped: CAWG 1.3 removed the field.
 
 [appendix]
 [[changelog]]
