@@ -7,7 +7,7 @@
 :sectanchors:
 :icons: font
 :source-highlighter: rouge
-:revnumber: 0.4-draft
+:revnumber: 0.5-draft
 :revdate: 2026-10-14
 :cawg-ia: https://cawg.io/identity/1.2/
 :c2pa-spec: https://c2pa.org/specifications/specifications/2.2/specs/C2PA_Specification.html
@@ -32,6 +32,10 @@ The Rust crate https://github.com/Cognitive-Proof/macawg[`macawg`] 0.2.0 is its 
 Each normative rule either traces to that crate or is marked *(proposed)*.
 A proposed rule is part of the intended protocol, but the reference implementation does not enforce it yet.
 Where this document names a crate function, the name is informative.
+
+The document separates the CAWG signing operation (<<operation>>) from the bindings that carry it.
+Binding A, the Macawg COSE/HTTPS exchange, is normative and implemented.
+Bindings B (OpenID4VCI issuance), C (OpenID4VP) and D (CSC) are proposed, and none is implemented (<<bindings>>, <<recommendation>>).
 ====
 
 == Introduction
@@ -46,19 +50,16 @@ This document fills that gap for the case where the identity assertion generator
 For example, the generator might be a camera and the holder a person's phone.
 It specifies:
 
-* an invite URI that carries a session id, a nonce, and a transport hint (<<invite>>);
-* a request format that carries the `signer_payload` and the identities the generator asks for (<<request>>);
-* authentication of the request with the generator's C2PA signing credential (<<request-auth>>);
-* the checks a wallet makes before signing (<<wallet-validation>>);
-* the unsigned ICA credential a wallet hands to an issuer (<<ica>>);
-* a response format and the checks the generator makes on it (<<response>>, <<device-validation>>);
-* transport bindings (<<transport>>).
+* the CAWG signing operation: its inputs, its result, and the guarantees every binding must give (<<operation>>);
+* binding A, the normative exchange: an invite URI, a COSE-signed request, wallet checks, a response, device checks, and HTTPS transport (<<binding-a>>);
+* how the wallet produces the signature in each mode (<<ica>>, <<x509>>);
+* proposed alternative bindings: OpenID4VCI issuance of ICA credentials (<<binding-b>>), OpenID4VP for the device-to-wallet exchange (<<binding-c>>), and CSC remote X.509 signing (<<binding-d>>).
 
 The following are out of scope:
 
 * the identity assertion itself, its CBOR encoding, and how a validator checks it ({cawg-ia}[CAWG Identity Assertion] §5–§8);
 * how an identity claims aggregator verifies a person's identities (for example, through OAuth);
-* the API between a wallet and an identity claims aggregator (<<issuer-api>> gives informative guidance only);
+* any wallet-to-issuer interface other than binding B, which is proposed;
 * rendering of QR codes and the user interface of the wallet.
 
 === Conceptual overview
@@ -106,6 +107,19 @@ The `c2paAsset` in that credential binds it to the assertions that the `signer_p
 * [[[RFC9110]]] Fielding, R., et al., _HTTP Semantics_, RFC 9110.
 * [[[VC-DATA-MODEL-2.0]]] W3C, _Verifiable Credentials Data Model v2.0_.
 * [[[DID-JWK]]] _did:jwk Method Specification_. https://github.com/quartzjer/did-jwk
+* [[[RFC8949]]] Bormann, C. and P. Hoffman, _Concise Binary Object Representation (CBOR)_, RFC 8949.
+* [[[RFC9053]]] Schaad, J., _CBOR Object Signing and Encryption (COSE): Initial Algorithms_, RFC 9053.
+* [[[RFC8230]]] Jones, M., _Using RSA Algorithms with CBOR Object Signing and Encryption (COSE) Messages_, RFC 8230.
+
+The following are normative only for the proposed bindings B, C and D.
+
+* [[[OpenID4VCI]]] OpenID Foundation, _OpenID for Verifiable Credential Issuance 1.0_. https://openid.net/specs/openid-4-verifiable-credential-issuance-1_0.html
+* [[[OpenID4VP]]] OpenID Foundation, _OpenID for Verifiable Presentations 1.0_. https://openid.net/specs/openid-4-verifiable-presentations-1_0.html
+* [[[RFC9101]]] Sakimura, N., Bradley, J. and M. Jones, _The OAuth 2.0 Authorization Framework: JWT-Secured Authorization Request (JAR)_, RFC 9101.
+* [[[RFC9396]]] Lodderstedt, T., Richer, J. and B. Campbell, _OAuth 2.0 Rich Authorization Requests_, RFC 9396.
+* [[[RFC9126]]] Lodderstedt, T., et al., _OAuth 2.0 Pushed Authorization Requests_, RFC 9126.
+* [[[CSC-API]]] Cloud Signature Consortium, _Architectures and protocols for remote signature applications_, version 2.0.0.2. https://cloudsignatureconsortium.org/wp-content/uploads/2023/04/csc-api-v2.0.0.2.pdf
+* [[[CSC-DMB]]] Cloud Signature Consortium, _CSC data model bindings_, version 1.0.0. https://cloudsignatureconsortium.org/wp-content/uploads/2025/10/data-model-bindings.pdf
 
 == Terms and definitions
 
@@ -168,6 +182,18 @@ The information a wallet gives an ICA issuer so that the issuer can produce a cr
 
 The holder of the C2PA signing certificate that signed a request envelope.
 
+==== Operation
+
+The CAWG signing operation of <<operation>>, independent of any encoding.
+
+==== Binding
+
+A definition of how the operation's inputs and result are encoded and carried, and how its guarantees are met (<<bindings>>).
+
+==== Request representation
+
+The exact octets that a binding defines as the request, over which the response proof's `request_digest` is computed (<<proof-domains>>).
+
 === Data encodings
 
 base64url::
@@ -221,6 +247,136 @@ A session asks for exactly one of these `sig_type` values, defined in <<CAWG-IA>
 
 A wallet MUST reject a request for any other `sig_type`.
 _(Traces to `check_request`.)_
+
+[[operation]]
+== The CAWG signing operation
+
+Macawg defines one operation, and carries it over one or more _bindings_.
+The operation says what is being approved and what each party must check.
+A binding says how the operation's inputs and result are encoded and transported, and how the guarantees below are achieved with that encoding.
+
+Binding A (<<binding-a>>), the Macawg COSE/HTTPS exchange, is the normative binding of this draft.
+The other bindings are proposed, and are described separately in <<binding-b>>, <<binding-c>> and <<binding-d>>.
+
+[[operation-inputs]]
+=== Inputs
+
+[cols="2,4,2",options="header"]
+|===
+|Input |Meaning |Binding A member
+
+|Signer payload |The exact CAWG `signer_payload` to be signed, including any `expected_*` members (<<CAWG-IA>> §5.2). |`signer_payload`
+|Mode |`cawg.identity_claims_aggregation` or `cawg.x509.cose` (<<_signature_types>>). |`signer_payload.sig_type`
+|Claim generator credential |The C2PA signing certificate chain that authenticates the request, and that will sign the claim. |`x5chain` of the request `COSE_Sign1`
+|Requested disclosures |Identity types, fields and providers the device asks for. ICA mode only. |`requested.identities`
+|Accepted issuers |ICA issuer DIDs the device accepts. ICA mode only. |`requested.accepted_issuers`
+|Maximum signature size |Space reserved for the identity assertion's `signature`. |`max_signature_size`
+|Proof requirement |Whether a request-to-result proof is mandatory (<<response-proof>>). |`response_proof_required`
+|Deadline |`issued_at` and `expires_at`, giving the acceptance deadline (<<acceptance-deadline>>). |`issued_at`, `expires_at`
+|Invitation values |Session id, nonce and the session's endpoint. |`session_id`, `nonce`, `session_url`
+|Display context |The requester's description of the content. Not security-relevant. |`context`
+|===
+
+[[operation-result]]
+=== Result
+
+The result is one of:
+
+Signed::
+The exact bytes for the identity assertion's `signature` field, and, when present, a response proof over the request and those bytes.
+
+Declined::
+No signature, with an optional reason.
+The reason `response_proof_unsupported` means the wallet could not produce a required proof.
+
+[[guarantees]]
+=== Guarantees
+
+Every binding MUST provide each of these guarantees.
+A binding that cannot provide one MUST say so, and MUST NOT be described as conforming for that mode.
+The section references give the binding A rules.
+
+[cols="1,3,5,2",options="header"]
+|===
+|Id |Guarantee |Requirement |Binding A
+
+|G1 |Claim generator authentication |The request is integrity-protected and signed with the claim generator's C2PA signing credential. The wallet validates the certificate profile and, in production, the C2PA trust list. |<<request-auth>>, <<trust-modes>>
+|G2 |Claim generator binding |`expected_claim_generator` in the signer payload identifies the certificate that authenticated the request. *(proposed; not implemented)* |<<expected-claim-generator>>
+|G3 |Invitation binding |The request is bound to the scanned invitation, and the response goes only to the destination named in the signed request, with no redirects. |<<_nonce_binding>>, <<transport-https>>
+|G4 |Exact payload |The wallet signs, or has issued, exactly the signer payload in the request. Unknown payload members are rejected, never dropped. |<<wire-signer-payload>>, <<extensions>>
+|G5 |Disclosure control |Only requested types, fields and providers; exactly the values the person approved; no other property, header or entry. The wallet checks before release. |<<selective-disclosure>>, <<wallet-release>>
+|G6 |Informed approval |The person sees the requester, the context as the requester's description, the roles, and the identity values and their publication, and agrees. |<<wallet-validation>>
+|G7 |Issuer acceptance |An ICA credential's issuer is in `accepted_issuers`, or allowed by an independent trust policy, and the credential is valid. |<<device-ica>>
+|G8 |Size |The signature fits `max_signature_size`. All inputs are within the maximums. |<<resource-limits>>
+|G9 |Exact bytes |The `signature` bytes travel unchanged from the signer to the identity assertion. Nobody repairs or rewrites them. |<<_use_of_the_signature>>
+|G10 |Request-to-result proof |When required, the key that made the identity signature also signs a digest of the exact request and a digest of the exact signature bytes. For ICA, the issuer signs only under current actor authorization. |<<response-proof>>
+|G11 |Deadline |One acceptance deadline applies to every party. |<<acceptance-deadline>>
+|G12 |Fail-closed extensions |A receiver that does not implement a security-relevant requirement rejects the request; it does not ignore the requirement. |<<extensions>>
+|===
+
+These properties are separate and must not be confused:
+
+Session correlation::
+A response names the session it belongs to (`session_id`, `nonce`, or OpenID4VP `state`). It proves nothing by itself.
+Holder-key possession::
+A key that a credential is bound to signs something. In ICA mode, Macawg has no holder key.
+Transaction authorization::
+The actor approves specific transaction data. In ICA mode this happens at the issuer (<<_producing_a_proof_for_ica>>).
+Issuer attestation::
+The ICA issuer signs the identities and the `c2paAsset`. This is what the asset publishes.
+
+G10 combines transaction authorization with a binding to the exact result.
+None of the other three provides it alone.
+
+[[proof-domains]]
+=== Request digest and proof domains
+
+The response proof payload is the same in every binding: the CBOR map `{ "request_digest": bstr, "signature_digest": bstr }` (<<response-proof>>).
+What a binding must define is its _request representation_, the exact octets that `request_digest` is computed over, and its external AAD.
+
+[cols="2,4,3,2",options="header"]
+|===
+|Binding |Request representation |External AAD |Status
+
+|A, COSE/HTTPS |The octets of the decoded envelope `request` member: the UTF-8 JSON exactly as signed. |`macawg.sign_response.v1` |Implemented
+|C, OpenID4VP |The octets of the Request Object, in JWS compact serialization, exactly as received from `request_uri`, before any decoding. |`macawg.sign_response.oid4vp.v1` *(proposed)* |Not implemented
+|===
+
+Binding B is not device-facing.
+It carries the device-facing binding's request digest and AAD to the issuer, unchanged (<<vci-dataset>>).
+Binding D is wallet-internal and uses the device-facing binding's values.
+
+These rules apply to every binding:
+
+* `request_digest` MUST be computed over the octets the device signed or served, as received. It MUST NOT be computed over JSON or claims that were parsed and serialized again.
+* Each binding MUST use its own external AAD, so that a proof made for one binding does not verify in another.
+* A new binding, or a change to a binding's request representation, MUST define a new AAD string.
+
+[[bindings]]
+=== Bindings and their status
+
+[cols="2,2,2,3",options="header"]
+|===
+|Binding |Between |Status |Implementation
+
+|A, Macawg COSE/HTTPS (<<binding-a>>) |Device and wallet |Normative |macawg 0.2.0, except G2
+|Local-key X.509 signing (<<x509>>) |Inside the wallet |Normative |macawg 0.2.0 (`x509` feature)
+|B, OpenID4VCI ICA issuance (<<binding-b>>) |Wallet and ICA issuer |Proposed |Not implemented
+|C, OpenID4VP (<<binding-c>>) |Device and wallet |Proposed, evaluation only |Not implemented
+|D, CSC `signHash` remote signing (<<binding-d>>) |Wallet and RSSP |Proposed, ES* and PS* only |Not implemented
+|D, CSC Data Model Bindings profile (<<binding-d-dmb>>) |Device and wallet, over OpenID4VP |Informative evaluation |Not implemented
+|===
+
+Bindings compose: a device and wallet use A (or C), and the wallet may use B with its ICA issuer, or D with an RSSP.
+
+[[binding-a]]
+== Binding A: Macawg COSE/HTTPS
+
+Binding A carries the operation as a COSE-signed JSON request, fetched over HTTPS after the wallet scans an invite, and a JSON response posted back to the same URL.
+It is the normative binding of this draft, and the one the reference implementation implements.
+
+The sections from <<invite>> to <<transport>> define binding A.
+<<ica>> and <<x509>> also define how the wallet produces the signature in each mode; binding B and binding D are alternatives for those wallet-side steps.
 
 [[invite]]
 == Invite URI
@@ -486,11 +642,16 @@ A wallet SHOULD present `context` as the requester's description, not as a verif
     "referenced_assertions": [
       {
         "url": "self#jumbf=c2pa.assertions/c2pa.hash.data",
-        "hash": "U3Rhbm..."
+        "alg": "sha256",
+        "hash": "gZXc8AkKv86pivdlRBEH0f__JnJJGh5EpjvAZZ-tUcU"
       }
     ],
     "sig_type": "cawg.identity_claims_aggregation",
-    "role": ["cawg.creator"]
+    "role": ["cawg.creator"],
+    "expected_claim_generator": {
+      "alg": "sha256",
+      "hash": "gVOf2oh5IrwNngepeVV-13bIOAGnUbzEvArJ4JgdBFI"
+    }
   },
   "max_signature_size": 8192,
   "requested": {
@@ -502,11 +663,15 @@ A wallet SHOULD present `context` as the requester's description, not as a verif
         "purpose": "Credit the photographer"
       }
     ],
-    "accepted_issuers": ["did:jwk:eyJrdHkiOiJPS1AiLC..."]
+    "accepted_issuers": ["did:web:ica.example"]
   },
   "context": { "title": "IMG_0042.jpg", "format": "image/jpeg" }
 }
 ----
+
+NOTE: This example shows intended conformance.
+It includes the REQUIRED `expected_claim_generator`, so the reference implementation, macawg 0.2.0, rejects it as an unknown `signer_payload` member (<<extensions>>).
+The hash values are illustrative 32-byte values, not real hashes of an asset or certificate.
 
 [[expected-claim-generator]]
 === `expected_claim_generator` binding *(proposed)*
@@ -518,6 +683,10 @@ This gives the wallet a check that the request signer is the party that will sig
 *(proposed)* A device MUST include `expected_claim_generator` in `signer_payload`, computed over the end-entity certificate of its C2PA signing credential as <<CAWG-IA>> §6.1.2 describes.
 
 *(proposed)* A wallet MUST compute the same value over the end-entity certificate in the request's `x5chain` (<<request-auth>>), and MUST reject the request if `expected_claim_generator` is absent or does not match.
+As <<CAWG-IA>> §6.1.2 specifies, the hash input is the certificate encoded as a CBOR byte string in deterministic encoding (<<RFC8949>> §4.2.1), not the bare DER, and the algorithm is the one named in `alg`.
+
+In the JSON form of <<wire-signer-payload>>, `expected_claim_generator` is `{ "alg": <string>, "hash": <base64url> }`.
+In an ICA credential's `c2paAsset`, its `hash` is standard base64, like the other hashes there (<<ica-vc>>).
 
 Without this check, a party that holds any C2PA certificate could sign a request whose `signer_payload` was computed by a different claim generator.
 The person would see one requester's name, while their identity would be attached to another party's claim.
@@ -807,20 +976,40 @@ The wallet would then check the entry against this structure before release, in 
     "https://cawg.io/identity/1.1/ica/context/"
   ],
   "type": ["VerifiableCredential", "IdentityClaimsAggregationCredential"],
-  "issuer": "did:jwk:...",
+  "issuer": "did:web:ica.example",
   "validFrom": "2026-10-14T09:31:02Z",
   "credentialSubject": {
-    "verifiedIdentities": [ ... ],
+    "verifiedIdentities": [
+      {
+        "type": "cawg.social_media",
+        "username": "ada",
+        "uri": "https://social.example/ada",
+        "verifiedAt": "2026-10-01T12:00:00Z",
+        "provider": { "id": "https://social.example", "name": "Social Example" }
+      }
+    ],
     "c2paAsset": {
       "sig_type": "cawg.identity_claims_aggregation",
       "referenced_assertions": [
-        { "url": "...", "alg": "sha256", "hash": "<standard base64>" }
+        {
+          "url": "self#jumbf=c2pa.assertions/c2pa.hash.data",
+          "alg": "sha256",
+          "hash": "gZXc8AkKv86pivdlRBEH0f//JnJJGh5EpjvAZZ+tUcU="
+        }
       ],
-      "role": ["cawg.creator"]
+      "role": ["cawg.creator"],
+      "expected_claim_generator": {
+        "alg": "sha256",
+        "hash": "gVOf2oh5IrwNngepeVV+13bIOAGnUbzEvArJ4JgdBFI="
+      }
     }
   }
 }
 ----
+
+This credential answers the example request: one `cawg.social_media` identity with exactly the requested `username` and `uri`, and an issuer in `accepted_issuers`.
+The hashes are the request's, in standard base64.
+`expected_claim_generator` in `c2paAsset` is intended conformance; macawg 0.2.0 cannot produce it.
 
 `c2paAsset` is the request's `signer_payload`, but its hashes are standard base64 (<<RFC4648>> §4), not base64url, as <<CAWG-IA>> §8.1 requires.
 `role` and `alg` are omitted when absent.
@@ -851,9 +1040,9 @@ This is a workaround for one validator, not a protocol requirement.
 [[issuer-api]]
 === Wallet to issuer interface (informative)
 
-This document does not standardise how a wallet reaches an ICA issuer, or how the issuer authenticates the person.
-An issuer API SHOULD accept the unsigned ICA credential defined above, so that the issuer can apply the same `accepted_issuers` and size rules.
-To support <<response-proof>>, the API also needs to carry the request digest and return the issuer's response proof.
+Binding B (<<binding-b>>) proposes a standard interface: OpenID4VCI with the issuance inputs in `authorization_details`.
+Its dataset carries the same information as the unsigned ICA credential above, plus the proof requirement.
+Until binding B is normative, an issuer interface SHOULD carry the same inputs, and SHOULD apply the same rules.
 The issuer API in the companion `macawg-wallet` repository is a draft and is not part of this specification.
 
 [[x509]]
@@ -910,9 +1099,9 @@ For X.509, it is the person's key.
 ==== Format
 
 * The payload is embedded. It is the deterministically encoded CBOR map `{ "request_digest": bstr, "signature_digest": bstr }`, with exactly these two keys.
-`request_digest` is the SHA-256 of the request bytes from the envelope.
+`request_digest` is the SHA-256 of the binding's request representation (<<proof-domains>>). In binding A, that is the request bytes from the envelope.
 `signature_digest` is the SHA-256 of the decoded `signature`.
-* The external AAD is the ASCII bytes `macawg.sign_response.v1`.
+* The external AAD is the binding's proof AAD (<<proof-domains>>). In binding A, it is the ASCII bytes `macawg.sign_response.v1`.
 * The protected header's `alg` is the identity signature's algorithm.
 
 _(Traces to `ica_response_proof`, `x509_response_proof`, `RESPONSE_PROOF_AAD`.)_
@@ -970,10 +1159,27 @@ The proof is not embedded in the asset, so it does not change the published cred
   "session_id": "q2b9Yv0rN4kM1pQyHk3ZtA",
   "nonce": "8m2cR0xV7JpLwE5uT1aGsQ",
   "status": "signed",
-  "signer_payload": { "referenced_assertions": [ ... ], "sig_type": "cawg.identity_claims_aggregation", "role": ["cawg.creator"] },
+  "signer_payload": {
+    "referenced_assertions": [
+      {
+        "url": "self#jumbf=c2pa.assertions/c2pa.hash.data",
+        "alg": "sha256",
+        "hash": "gZXc8AkKv86pivdlRBEH0f__JnJJGh5EpjvAZZ-tUcU"
+      }
+    ],
+    "sig_type": "cawg.identity_claims_aggregation",
+    "role": ["cawg.creator"],
+    "expected_claim_generator": {
+      "alg": "sha256",
+      "hash": "gVOf2oh5IrwNngepeVV-13bIOAGnUbzEvArJ4JgdBFI"
+    }
+  },
   "signature": "0oRYJqIBJwN..."
 }
 ----
+
+The `signer_payload` equals the request's, as it must.
+The `signature` value is truncated for display; a real response carries the whole credential.
 
 [[device-validation]]
 == Device validation of a response
@@ -1044,7 +1250,7 @@ The device SHOULD rate-limit submissions per session.
 * The device MUST discard the session once it is finished, or once the acceptance deadline has passed (<<acceptance-deadline>>).
 
 [[transport]]
-== Transport bindings
+== Transports for binding A
 
 [[transport-https]]
 === HTTPS (normative)
@@ -1107,7 +1313,431 @@ This draft does not define the GATT characteristics, how messages are fragmented
 A future version will define them.
 Until then, BLE is not interoperable.
 
+[[binding-b]]
+== Binding B: OpenID4VCI issuance of ICA credentials *(proposed)*
+
+This binding defines how a wallet obtains an ICA credential from an ICA issuer using <<OpenID4VCI>>.
+It replaces the informal wallet-to-issuer interface of earlier drafts (<<issuer-api>>).
+It does not change the device-facing exchange: the wallet still answers the device through binding A, or through binding C.
+
+Status: proposed. Not implemented. Every identifier in this section is proposed, and its name is a placeholder until a namespace is chosen (<<extension-inventory>>).
+
+=== Roles
+
+[cols="2,3",options="header"]
+|===
+|Macawg |OpenID4VCI
+|Wallet |Wallet, acting as the OAuth client
+|ICA issuer |Credential Issuer, with its Authorization Server
+|Named actor |End-User who authenticates at the Authorization Server
+|ICA credential |Credential, of the format in <<vci-config>>
+|===
+
+The person needs only an account at the issuer.
+The binding does not need an existing holder-bound credential, or a wallet signing key.
+The credential is issued without cryptographic key binding, which <<OpenID4VCI>> §14.2 allows for bearer credentials.
+Its binding is to the asset, through `c2paAsset`, not to a holder.
+
+[[vci-config]]
+=== Credential configuration
+
+The issuer publishes a credential configuration in its Credential Issuer Metadata (<<OpenID4VCI>> §12.2.4):
+
+[source,json]
+----
+{
+  "credential_issuer": "https://ica.example",
+  "credential_endpoint": "https://ica.example/credential",
+  "authorization_servers": ["https://ica.example"],
+  "credential_configurations_supported": {
+    "cawg_ica": {
+      "format": "macawg_ica_cose",
+      "credential_signing_alg_values_supported": ["EdDSA"],
+      "macawg_issuer_did": "did:web:ica.example"
+    }
+  }
+}
+----
+
+`format` `macawg_ica_cose` *(proposed)*::
+A Credential Format Profile, as <<OpenID4VCI>> Appendix A lets deployments define.
+A credential of this format is the tagged `COSE_Sign1` of <<ica-cose>>, meeting <<ica-properties>> and <<ica-cose-profile>>.
+In a Credential Response it is the base64url encoding of those bytes, as <<OpenID4VCI>> §8.3 requires for binary formats.
+
+`macawg_issuer_did` *(proposed)*::
+The DID that will appear in the credential's `issuer`.
+
+The configuration MUST NOT include `cryptographic_binding_methods_supported` or `proof_types_supported`, so a Credential Request carries no `proofs` (<<OpenID4VCI>> §8.2).
+
+=== Issuer identity: DIDs and HTTPS endpoints
+
+The device trusts ICA issuers by DID (`accepted_issuers`).
+<<OpenID4VCI>> identifies a Credential Issuer by an HTTPS URL (§12.2.1).
+This binding connects the two without adding a new device-side trust input:
+
+. The wallet chooses an issuer endpoint whose `macawg_issuer_did` is in `accepted_issuers`, or is allowed by the wallet's issuer policy when `accepted_issuers` is empty.
+. Unless the metadata is signed (<<OpenID4VCI>> §12.2.3), `macawg_issuer_did` is only a routing hint, protected by TLS.
+. The binding is the credential's signed `issuer`. Before release, the wallet MUST check that `issuer` equals the advertised `macawg_issuer_did`, and that it is accepted (<<wallet-release>>).
+. For `did:web`, the DID's host SHOULD equal the host of the Credential Issuer Identifier. A wallet SHOULD refuse an issuer where they differ, unless its policy names that pairing.
+
+The device's checks are unchanged: it checks the DID and the signature (<<device-ica>>), and never needs the issuer's URL.
+
+[[vci-dataset]]
+=== Issuance inputs: an immutable dataset in `authorization_details`
+
+The wallet must give the issuer the signer payload, the approved identity values, the maximum size, and the proof requirement.
+Two designs were considered.
+
+Custom Credential Request parameters (rejected)::
+<<OpenID4VCI>> §8.2 allows additional Credential Request parameters, but says the Credential Issuer "MUST ignore any unrecognized parameters".
+An issuer that does not implement Macawg would ignore the signer payload and the identities, and issue some other credential.
+That fails open, breaking G4, G5 and G12.
+The inputs would also arrive only after authorization, so the actor's consent would not cover them.
+
+A dataset prepared before authorization (chosen)::
+The wallet puts the inputs in an `authorization_details` object of type `openid_credential` (<<OpenID4VCI>> §5.1.1, <<RFC9396>>).
+<<OpenID4VCI>> §5.1.1 lets additional fields be defined for this type.
+<<RFC9396>> §5 requires the Authorization Server to reject an object of a known type that has unknown fields, with `invalid_authorization_details`.
+So an issuer that does not implement Macawg fails closed.
+The Authorization Server shows the dataset to the actor before consent.
+It returns the granted `authorization_details` in the Token Response (<<RFC9396>> §7), with `credential_identifiers` (<<OpenID4VCI>> §6.2).
+The Credential Request then names a `credential_identifier`, so the issuer issues exactly the authorized dataset.
+
+==== The `authorization_details` object *(proposed)*
+
+[cols="2,1,4",options="header"]
+|===
+|Member |Presence |Meaning
+
+|`type` |REQUIRED |`openid_credential`.
+|`credential_configuration_id` |REQUIRED |A configuration whose `format` is `macawg_ica_cose`.
+|`macawg_signer_payload` |REQUIRED |The device's `signer_payload`, in the JSON form of <<wire-signer-payload>>, unchanged.
+|`macawg_verified_identities` |REQUIRED |The `verifiedIdentities` entries the person approved, with their exact values.
+|`macawg_max_signature_size` |REQUIRED |The device's `max_signature_size`.
+|`macawg_accepted_issuers` |OPTIONAL |The device's `accepted_issuers`, if non-empty.
+|`macawg_response_proof` |OPTIONAL |Present if and only if the device requires a response proof. An object with `request_digest` (base64url of the 32-byte digest) and `aad` (the device-facing binding's AAD string, <<proof-domains>>).
+|===
+
+A receiver MUST reject the object if it contains a member it does not recognise.
+
+Example, as pushed with PAR:
+
+[source,json]
+----
+[
+  {
+    "type": "openid_credential",
+    "credential_configuration_id": "cawg_ica",
+    "macawg_signer_payload": {
+      "referenced_assertions": [
+        { "url": "self#jumbf=c2pa.assertions/c2pa.hash.data", "alg": "sha256", "hash": "gZXc8AkKv86pivdlRBEH0f__JnJJGh5EpjvAZZ-tUcU" }
+      ],
+      "sig_type": "cawg.identity_claims_aggregation",
+      "role": ["cawg.creator"],
+      "expected_claim_generator": { "alg": "sha256", "hash": "gVOf2oh5IrwNngepeVV-13bIOAGnUbzEvArJ4JgdBFI" }
+    },
+    "macawg_verified_identities": [
+      {
+        "type": "cawg.social_media",
+        "username": "ada",
+        "uri": "https://social.example/ada",
+        "verifiedAt": "2026-10-01T12:00:00Z",
+        "provider": { "id": "https://social.example", "name": "Social Example" }
+      }
+    ],
+    "macawg_max_signature_size": 8192,
+    "macawg_accepted_issuers": ["did:web:ica.example"],
+    "macawg_response_proof": {
+      "request_digest": "uU0nuZNNPgilLlLX2n2r-sSE7-N6U4DukIj3rOLvzek",
+      "aad": "macawg.sign_response.v1"
+    }
+  }
+]
+----
+
+==== Flow
+
+. The wallet validates the device's request, and the person approves the identities in the wallet (<<wallet-validation>>).
+. The wallet sends a Pushed Authorization Request (<<RFC9126>>) with the dataset in `authorization_details`, using the authorization code flow with PKCE (<<OpenID4VCI>> §5).
+PAR is REQUIRED in this binding, because the dataset is too large for a URL.
+The pre-authorized code flow MUST NOT be used, because the issuer could not then obtain the actor's current authorization for this dataset.
+. The Authorization Server:
+.. MUST reject the request if any member is unknown, or if `macawg_accepted_issuers` is non-empty and does not contain its DID;
+.. MUST authenticate the named actor in this authorization transaction when `macawg_response_proof` is present, and SHOULD do so otherwise. Reusing an earlier session without the actor's action is not enough when a proof is required;
+.. MUST check every entry of `macawg_verified_identities` against what the issuer has verified for this actor, and refuse if any differs;
+.. MUST show the actor the identity values and the fact that they will be published in an asset, and obtain consent.
+. The Token Response MUST return `authorization_details` identical to the pushed object, with `credential_identifiers`.
+The Authorization Server MUST NOT narrow or change the dataset, because a changed dataset would not be what the person approved in the wallet.
+The wallet MUST compare the returned object with the one it pushed, and stop if they differ.
+. The wallet sends a Credential Request with `credential_identifier`, and no other Macawg parameters.
+. The Credential Issuer:
+.. MUST issue exactly one credential that meets <<ica-vc>>, <<ica-properties>> and <<ica-cose-profile>>, with `c2paAsset` equal to `macawg_signer_payload` and `verifiedIdentities` equal to `macawg_verified_identities`;
+.. MUST refuse if the credential is longer than `macawg_max_signature_size`;
+.. if `macawg_response_proof` is present, MUST return a response proof (<<response-proof>>) over the given `request_digest` and the issued credential's bytes, with the given `aad`, in the Credential Response parameter `macawg_response_proof` (base64url). <<OpenID4VCI>> §8.3 allows additional Credential Response parameters.
+The issuer MUST create the proof only within this authorized transaction;
+.. MUST NOT use deferred issuance (<<OpenID4VCI>> §9), because the acceptance deadline is short.
+. The wallet decodes the credential and runs the checks of <<wallet-release>>, including the issuer check above.
+If a proof is required, the wallet MUST also verify it as the device would (<<_validating_a_proof>>), using the request representation it holds.
+. Only then does the wallet send the signed response to the device.
+
+A wallet whose issuer rejects the dataset, or cannot return a required proof, answers the device with `declined`, and `reason` `response_proof_unsupported` where that is the cause.
+
+==== Changes from earlier drafts
+
+Trust model:: Unchanged. The device trusts DIDs; the issuer endpoint is only located by URL.
+Privacy:: Unchanged in content: the issuer sees the signer payload hashes and the identities, as before. The dataset now also passes through the Authorization Server.
+Cryptography:: Unchanged. The credential and the proof are the same objects.
+User experience:: The person authenticates at the issuer for each signing that requires a proof. This was already required by G10.
+Wire representation:: Binding A is unchanged. The wallet-to-issuer interface is new; the earlier one was informative only.
+
+[[binding-c]]
+== Binding C: OpenID4VP device-to-wallet exchange *(proposed, evaluation)*
+
+This section evaluates carrying the operation over <<OpenID4VP>> instead of binding A.
+It defines enough to show which parts reuse standard mechanisms, which need extensions, and which binding A checks need new rules.
+It is not ready to be normative (<<recommendation>>).
+
+Status: proposed, for evaluation. Not implemented. Every identifier here is a placeholder (<<extension-inventory>>).
+
+=== Mapping
+
+[cols="2,3,3",options="header"]
+|===
+|Operation input |OpenID4VP element |Kind of reuse
+
+|Claim generator credential (G1) |Signed Request Object (<<OpenID4VP>> §5, <<RFC9101>>) with `typ` `oauth-authz-req+jwt`, the C2PA chain in `x5c`, and Client Identifier Prefix `x509_hash` (<<OpenID4VP>> §5.9.3) |Profile: the wallet validates `x5c` against the C2PA trust list and certificate profile, not the Web PKI
+|Invitation (G3) |QR code with `client_id` and `request_uri` (<<OpenID4VP>> §5.7, §5.10) |Configuration, plus the rules in <<vp-invitation>>
+|Nonce, session id |`nonce` and `state` (<<OpenID4VP>> §5.2, §5.3) |Configuration
+|Session endpoint |`response_uri` with `response_mode` `direct_post` or `direct_post.jwt` (<<OpenID4VP>> §8.2, §8.3) |Configuration, plus the rules in <<vp-invitation>>
+|Deadline (G11) |Request Object `iat` and `exp` |Configuration; the clock-skew rule is Macawg's
+|Signer payload, mode, maximum size, requested disclosures, accepted issuers, proof requirement, context |One `transaction_data` entry (<<OpenID4VP>> §5.1) of type `macawg_cawg_sign` |Extension: a new transaction data type
+|Result |`vp_token` entry for the DCQL credential query named in `credential_ids` (<<OpenID4VP>> §8.1) |Extension: a new credential format or response member
+|===
+
+`x509_hash` is the base64url SHA-256 of the DER leaf certificate.
+`expected_claim_generator` is a hash of the same certificate encoded as a CBOR byte string (<<CAWG-IA>> §6.1.2), so the two values differ.
+The wallet MUST compute both from the same `x5c` leaf certificate, and check each.
+
+==== Transaction data type `macawg_cawg_sign` *(proposed)*
+
+The decoded entry is a JSON object:
+
+[source,json]
+----
+{
+  "type": "macawg_cawg_sign",
+  "credential_ids": ["cawg"],
+  "signer_payload": { "...": "as in binding A" },
+  "max_signature_size": 8192,
+  "requested": { "...": "as in binding A, ICA mode only" },
+  "context": { "title": "IMG_0042.jpg" }
+}
+----
+
+* Its members have the meanings they have in binding A.
+* A wallet MUST reject an entry with a member it does not recognise.
+* `response_proof_required` is absent, because binding C always requires a response proof (<<vp-authorization>>).
+* All Macawg semantics MUST be inside this entry.
+OAuth and <<OpenID4VP>> ignore unknown Request Object parameters, so a requirement placed there would fail open.
+<<OpenID4VP>> §5.1 requires a wallet to return an error if a request contains an unrecognized transaction data type, so this entry fails closed (G12).
+
+[[vp-authorization]]
+=== Which credential authorizes the transaction?
+
+In <<OpenID4VP>>, transaction data is authorized by presenting a credential with Holder Binding.
+The wallet includes a representation of the transaction data in that presentation (§8.4), for example `transaction_data_hashes` in an SD-JWT VC Key Binding JWT (Appendix B.3.3.1), or in mdoc `DeviceSigned` (Appendix B.2.1).
+
+Neither mode of Macawg fits that model directly:
+
+ICA mode::
+The wallet holds no credential to present.
+The ICA credential is issued during the exchange (<<vp-issuance>>), and it is a bearer credential with no holder key (<<binding-b>>).
+The only party that can authorize the transaction with a key is the ICA issuer, under current actor authorization.
+So in binding C, the representation of the transaction data in the presentation is the response proof, signed by the issuer over the Request Object digest.
+
+X.509 mode::
+The person's X.509 key signs both the identity signature and the response proof.
+The authorizing credential is the X.509 certificate, presented in the CSC X.509 format (<<binding-d-dmb>>).
+
+Because the response proof is the only thing that binds the result to the transaction, binding C MUST always require it.
+Without it, the presentation would carry no representation of the transaction data, which §8.4 requires.
+
+This is a new credential prerequisite only in X.509 mode, where the wallet needs the CSC X.509 format.
+ICA mode needs no holder credential, but it needs binding B.
+
+[[vp-issuance]]
+=== How the wallet obtains a new ICA credential
+
+Between validating the Request Object and posting the response, the wallet runs binding B.
+It builds the dataset from the `macawg_cawg_sign` entry and the person's approval.
+`macawg_response_proof.request_digest` is the SHA-256 of the Request Object's compact serialization as received, and `aad` is `macawg.sign_response.oid4vp.v1` (<<proof-domains>>).
+The acceptance deadline from the Request Object's `exp` applies to the whole issuance.
+
+Issuance and presentation stay distinct.
+Binding B authorizes issuance at the issuer.
+Binding C carries the request and the result between device and wallet.
+The response proof links the two.
+
+=== How the device gets the exact signature bytes
+
+The DCQL query (<<OpenID4VP>> §6) has one Credential Query with `id` `cawg`.
+In ICA mode its `format` is `macawg_ica_cose`; in X.509 mode it is the CSC X.509 format.
+The ICA mode query states that no Holder Binding proof is expected.
+<<OpenID4VP>> §8.6 allows a request to waive Holder Binding; the exact DCQL parameter for this is not verified in this draft.
+
+The `vp_token` is `{ "cawg": [ <presentation> ] }` (<<OpenID4VP>> §8.1).
+
+* For `macawg_ica_cose`, the presentation is the JSON object `{ "signature": <base64url>, "response_proof": <base64url> }` *(proposed)*.
+* For the CSC X.509 format, the presentation is an `x509PresentationResponse` (<<CSC-DMB>> §8.2) with an additional member `cawg` holding the same object *(proposed; needs agreement with CSC)*.
+
+The device decodes `signature` and uses those bytes unchanged (G9).
+
+=== How exact disclosure restrictions are enforced
+
+DCQL selects claims by path and can constrain values (<<OpenID4VP>> §6).
+It cannot express "exactly one identity of this type, with exactly these fields and no others", forbid additional properties, or bind the exact values the person approved in the wallet.
+So the `requested` member inside `macawg_cawg_sign` remains authoritative, and the wallet and device checks of binding A apply unchanged (<<selective-disclosure>>, <<wallet-release>>, <<device-ica>>).
+A DCQL `claims` list MAY mirror `requested` to help generic wallet interfaces, but it is not used for any decision.
+
+`accepted_issuers` also stays in the transaction data.
+DCQL `trusted_authorities` (<<OpenID4VP>> §6.1) does not, in the text reviewed, define a type for a list of DIDs.
+
+=== How unsupported requirements are rejected
+
+* An unknown transaction data type: the wallet returns an error (<<OpenID4VP>> §5.1).
+* A wallet that does not support `transaction_data` at all rejects the request (§5.1).
+* An unknown member inside `macawg_cawg_sign`: the wallet rejects the request (this binding).
+* An unsupported credential format: the device's `vp_formats_supported` and the DCQL `format` let the wallet detect it, and it returns an error.
+* A required proof that the issuer cannot produce: the wallet returns an error instead of a presentation.
+
+[[vp-invitation]]
+=== Invitation-binding checks that need new rules
+
+Binding A puts the nonce in the QR code, and checks that the signed request echoes it.
+In <<OpenID4VP>> the QR code carries only `client_id` and `request_uri`, and the nonce is inside the signed Request Object.
+These rules replace the binding A checks:
+
+. `request_uri` MUST contain at least 128 bits of entropy, and the device MUST serve it only until the acceptance deadline. It is the invitation secret.
+. The `client_id` in the QR code MUST equal the Request Object's `client_id`, including the prefix (<<OpenID4VP>> §5.10.1). The wallet MUST check this.
+. The wallet MUST check that the origin of `response_uri`, from the signed Request Object, equals the origin of the `request_uri` it fetched. This replaces the exact `session_url` comparison (<<url-comparison>>), because <<OpenID4VP>> uses two different URLs.
+. The wallet MUST NOT follow HTTP redirects when it fetches `request_uri` or posts to `response_uri`.
+. The device MUST NOT return `redirect_uri` in its response to the wallet's POST. <<OpenID4VP>> §8.2 says the wallet must follow one when present; in a cross-device flow that would only open a browser on the phone.
+. The wallet SHOULD use `request_uri_method` `post` with `wallet_nonce` (<<OpenID4VP>> §5.10), so the Request Object is fresh for this wallet.
+
+<<OpenID4VP>> §14.2 notes that `direct_post` is susceptible to session fixation, and that its response-code mitigation does not apply to cross-device flows.
+The relay analysis of <<relay>> applies unchanged: possession of the QR code is not proximity.
+
+=== Trust model, privacy and user experience
+
+Trust model:: The same certificate authenticates the request. The wallet's trust anchors for `x509_hash` requests MUST be the C2PA trust list, not a Web PKI or OpenID Federation anchor.
+Privacy:: No new disclosure in ICA mode. `direct_post.jwt` adds response confidentiality beyond TLS.
+Cryptography:: The request signature is JWS, not COSE. The proof uses a new AAD (<<proof-domains>>).
+User experience:: A generic OpenID4VP wallet cannot complete the exchange. It must implement the Macawg transaction data type and format.
+
+[[binding-d]]
+== Binding D: X.509 signing with CSC *(proposed)*
+
+This section covers `cawg.x509.cose` signatures made with a key that the wallet does not hold.
+It distinguishes two Cloud Signature Consortium specifications:
+
+* the CSC API (<<CSC-API>>), between a signing application and a remote signing service provider (RSSP), which binding D uses inside the wallet;
+* CSC Data Model Bindings (<<CSC-DMB>>), a wallet-facing binding for relying parties, evaluated in <<binding-d-dmb>>.
+
+Local-key signing stays supported and normative: the wallet signs with a key it holds, as <<x509>> describes.
+
+=== Remote signing with `signatures/signHash` *(proposed)*
+
+The wallet builds the CAWG `COSE_Sign1` itself, and asks the RSSP only for the raw signature.
+
+. The wallet builds the `COSE_Sign1` that <<CAWG-IA>> §8.2 specifies for `cawg.x509.cose`, including the protected header, the certificate chain, the payload placement and the external AAD that §8.2 requires.
+. It computes `ToBeSigned`, the CBOR encoding of the `Sig_structure` `["Signature1", protected, external_aad, payload]` (<<RFC9052>> §4.4).
+. It hashes `ToBeSigned` with the hash the algorithm uses, and calls `signatures/signHash` (<<CSC-API>> §11.10) with that digest in `hashes`, and the `signAlgo` from the table below.
+. It converts the returned signature to the COSE form, as the table says.
+. It inserts the signature, encodes the tagged `COSE_Sign1`, and verifies it locally with the certificate before release (<<x509>>).
+
+[cols="1,3,2,3",options="header"]
+|===
+|COSE `alg` |CSC `signAlgo` and parameters |Digest for `hashes` |Conversion to COSE
+
+|ES256 (-7) |`1.2.840.10045.4.3.2`, ecdsa-with-SHA256 |SHA-256(`ToBeSigned`) |DER `ECDSA-Sig-Value` to 64-byte `r‖s` (<<RFC9053>> §2.1)
+|ES384 (-35) |`1.2.840.10045.4.3.3`, ecdsa-with-SHA384 |SHA-384(`ToBeSigned`) |DER to 96-byte `r‖s`
+|ES512 (-36) |`1.2.840.10045.4.3.4`, ecdsa-with-SHA512 |SHA-512(`ToBeSigned`) |DER to 132-byte `r‖s`
+|PS256 (-37) |`1.2.840.113549.1.1.10`, RSASSA-PSS, with `signAlgoParams` for SHA-256, MGF1 with SHA-256, salt length 32 |SHA-256(`ToBeSigned`) |None: the RSA signature is used as is
+|PS384 (-38), PS512 (-39) |RSASSA-PSS with the matching hash, MGF1 hash and salt length |SHA-384 or SHA-512 |None
+|EdDSA (-8) |Not possible with `signHash` |— |—
+|===
+
+ECDSA encoding::
+<<CSC-API>> v2.0 does not say how an ECDSA result is encoded.
+A wallet MUST accept a DER `ECDSA-Sig-Value` and convert it, and MUST reject a result it cannot convert to the exact COSE length.
+
+RSASSA-PSS salt length::
+COSE PS256, PS384 and PS512 use a salt as long as the hash (<<RFC8230>>). The wallet MUST send `signAlgoParams` that say so.
+
+Ed25519::
+COSE `EdDSA` (-8) is pure Ed25519 over the whole `ToBeSigned` message; COSE does not use the prehash variant (<<RFC9053>> §2.2).
+`signHash` takes a digest.
+Ed25519ph over a digest gives a signature that does not verify as COSE -8, and pure Ed25519 over a digest signs the wrong message.
+So an RSSP can make a CAWG Ed25519 signature only if its API signs arbitrary `ToBeSigned` bytes.
+<<CSC-API>> v2.0 lists no EdDSA algorithm, and `signatures/signDoc` produces AdES formats, not COSE.
+Whether later CSC API versions add raw-message signing was not verified for this draft.
+
+==== Authorization
+
+The RSSP authorizes signing for specific digests: `credentials/authorize` takes `hashes`, and OAuth authorization can carry `authorization_details` of type `credential` with `documentDigests` and `hashAlgorithmOID` (<<CSC-API>> §8.4, §11.6).
+`signHash` rejects a digest the authorization does not cover.
+
+* The wallet MUST authorize exactly the `ToBeSigned` digest.
+* It SHOULD give a `label` that identifies a CAWG identity assertion and the asset's title.
+* The RSSP's consent screen shows a digest and a label, not the identity semantics. G6 remains the wallet's job.
+
+==== Response proofs with a remote key
+
+A response proof's `ToBeSigned` includes the digest of the identity signature, which exists only after the first `signHash` call.
+Because authorization binds digests in advance, the proof needs a second authorization, which normally means a second user action, unless the RSSP authorizes two signatures without fixed digests.
+This is an open issue for binding D: requiring a proof with a remote key costs a second approval.
+
+==== Certificate trust
+
+The certificate must meet <<CAWG-IA>> §8.2 and the validators' trust lists for CAWG X.509 identities.
+Qualification for eIDAS QES (`signatureQualifier`) is a separate matter: CAWG validators do not evaluate it.
+An RSSP certificate issued for AdES signing might not meet CAWG's X.509 requirements. This draft has not checked that, and a profile must.
+
+[[binding-d-dmb]]
+=== CSC Data Model Bindings (informative evaluation)
+
+<<CSC-DMB>> 1.0 lets a relying party ask a wallet, over <<OpenID4VP>>, to create a signature with an X.509 certificate.
+It defines:
+
+* the credential format `https://cloudsignatureconsortium.org/2025/x509`, and `x509MetadataQuery` with `certificateFingerprints`, `certificatePolicies` and `keys` for choosing a certificate (§8, §8.1);
+* the transaction data type `https://cloudsignatureconsortium.org/2025/qes` with `signatureRequests` (§6.2.1);
+* the response `qesResponse`, with `documentWithSignature` or `signatureObject`, as padded base64, inside `x509PresentationResponse.qes` (§6.2.2, §8.2);
+* rendering rules for the approval screen (§6.4).
+
+Reusable for Macawg X.509 mode::
+The X.509 format identifier and `x509MetadataQuery`, for certificate selection in binding C.
+The rendering rules are a useful model for G6.
+
+Not reusable::
+The `qes` type is for AdES signatures (`signature_format` C, X, J or P) over documents fetched by `href` or `data:` URL.
+It makes `signatureQualifier` mandatory, and so assumes a QES.
+It has no COSE output, and no notion of a CBOR `signer_payload`.
+
+Needed extensions::
+A transaction data type for CAWG COSE signing (`macawg_cawg_sign`, <<binding-c>>) whose `credential_ids` names the X.509 query, and a new `cawg` member in `x509PresentationResponse`.
+That structure belongs to CSC, so the member needs CSC's agreement, or a Macawg-owned format instead.
+
+<<CSC-DMB>> Note 25 says a QES made this way has no Holder Binding and can be replayed.
+Macawg's response proof addresses exactly that gap.
+<<CSC-DMB>> also says its transaction data types are likely to change (Notes 6, 16 and 18), so a Macawg profile of it should not be normative yet.
+
 == Security considerations
+
+=== Bindings
+
+The considerations below are written for binding A.
+They apply to binding C as amended by <<vp-invitation>>, and binding B and binding D keep every guarantee of <<guarantees>> except where their sections say otherwise.
+A proof made in one binding never verifies in another, because each binding has its own AAD (<<proof-domains>>).
 
 === Requester authentication
 
@@ -1303,63 +1933,276 @@ A `declined` response tells the device only that the person refused.
 
 [appendix]
 [[comparison]]
-== Comparison with OpenID4VP and OpenID4VCI (informative)
+== Relationship to OpenID4VP, OpenID4VCI and CSC (informative)
 
-Macawg overlaps with the OpenID for Verifiable Presentations (OpenID4VP) and OpenID for Verifiable Credential Issuance (OpenID4VCI) families.
-This appendix explains why it does not reuse them directly, and where it could converge.
+This appendix states where Macawg overlaps existing work and what remains specific to it.
+<<compat-matrix>> gives the requirement-by-requirement detail.
 
-=== OpenID4VP and DCQL
+=== What is not new
 
-In OpenID4VP, a verifier asks a wallet to present credentials that it already holds.
-Requests can be signed (JAR, `request_uri`), can be reached by a QR code, and can use the Digital Credentials Query Language (DCQL) to ask for credential types and claims.
+Most of binding A's transport pattern already exists elsewhere:
 
-[cols="1,2,2",options="header"]
+* <<OpenID4VP>> already has signed Request Objects fetched by reference from a QR code, X.509-authenticated verifiers (`x509_hash`), `nonce` and `state`, and `direct_post` to a `response_uri`.
+* <<OpenID4VP>> transaction data (§5.1, §8.4) already lets a verifier ask a wallet to authorize typed data, rejects unknown types, and binds a hash of the data into the presentation with the holder's key.
+* <<CSC-DMB>> already uses that mechanism to ask a wallet for a signature made with an X.509 certificate, and returns the signature inside the presentation.
+* <<OpenID4VCI>> already defines wallet-driven issuance with rich, consented `authorization_details`.
+* <<CSC-API>> already defines remote signing of a digest under per-digest authorization.
+
+=== What Macawg adds
+
+The CAWG-specific contribution is the operation (<<operation>>):
+
+* approval of an exact CAWG `signer_payload`, with unknown members rejected;
+* binding the request's authenticating certificate to `expected_claim_generator` (G2);
+* a disclosure profile for credentials that are published inside an asset (G5): exact values, a closed property set, and fixed COSE headers;
+* issuance of an ICA credential for one asset, during the exchange, with no holder key;
+* a request-to-result proof made with the identity signature's key, over the exact request octets and the exact signature octets (G10);
+* the size, deadline and fail-closed rules that make this interoperable.
+
+=== Where the overlap stops
+
+OpenID4VP transaction authorization::
+It assumes a presented credential with Holder Binding.
+Macawg's ICA mode has none: the result is a newly issued bearer credential, and the authorizing key is the issuer's.
+The presentation is evidence for the verifier; Macawg's result is an artifact to embed in an asset.
+DCQL cannot express Macawg's exact disclosure rules.
+
+CSC Data Model Bindings::
+The closest prior art for X.509 mode.
+It is limited to AdES formats and QES, has no COSE output, and notes that its result can be replayed.
+
+OpenID4VCI::
+Fits the wallet-to-issuer step closely (<<binding-b>>).
+Per-asset inputs need extension fields, and the proof needs an extension response parameter.
+
+CSC API::
+Fits remote ECDSA and RSASSA-PSS keys.
+It cannot produce CAWG Ed25519 signatures through `signHash`, and a proof costs a second authorization.
+
+So Macawg can reuse a great deal, but no existing specification provides the operation itself.
+Bindings B, C and D show how much of the transport can be standard; the operation's guarantees still need the Macawg rules.
+
+[appendix]
+[[compat-matrix]]
+== Compatibility matrix (informative)
+
+Kinds of reuse:
+
+Configuration:: The standard mechanism is used as defined, with chosen values.
+Profile:: The standard mechanism is used with additional restrictions.
+Extension:: A standard extension point carries data whose meaning Macawg defines. The standard does not define how recipients must interpret it.
+CAWG behavior:: The behavior is defined by <<CAWG-IA>>, not by a transport standard.
+None:: No standard mechanism; Macawg defines it.
+
+The last column says whether binding A's wire representation stays unchanged if the mechanism is adopted.
+
+[cols="2,3,1,3,1",options="header"]
 |===
-|Concern |OpenID4VP + DCQL |Macawg
+|Requirement |Existing mechanism and section |Reuse |Change to trust, privacy, cryptography or UX |Binding A unchanged?
 
-|What is returned
-|A presentation of a credential the wallet already holds, bound to the verifier by `nonce` and `aud`.
-|A new credential, issued for one C2PA claim and bound to it by `c2paAsset`.
+|G1 Request authentication
+|<<OpenID4VP>> §5 signed Request Object, <<RFC9101>> §5; `x509_hash` and `x5c`, <<OpenID4VP>> §5.9.3
+|Profile
+|Same certificate. The chain is validated against the C2PA trust list. JWS replaces COSE.
+|Yes
 
-|Query
-|DCQL: credential formats, claim paths, and alternative credential sets.
-|`requested`: CAWG identity types, a fixed set of fields, providers, and issuers. Narrower, and tied to <<CAWG-IA>> §8.1.
+|G2 Claim generator binding
+|<<CAWG-IA>> §6.1.2 `expected_claim_generator`. `x509_hash` names the same certificate but hashes DER, not the CBOR byte string.
+|CAWG behavior
+|None. Not implemented anywhere yet.
+|Yes
 
-|Verifier authentication
-|Client identifier schemes such as `x509_san_dns`, `verifier_attestation`, or pre-registration.
-|The C2PA signing certificate, checked against the C2PA trust list.
+|G3 Invitation nonce
+|`nonce`, `state`, <<OpenID4VP>> §5.2, §5.3
+|Configuration, plus Macawg rules
+|The QR code no longer carries the nonce. The secret becomes `request_uri` (<<vp-invitation>>).
+|Yes
 
-|Holder binding
-|Key binding proof from the holder.
-|The issuer's signature over `c2paAsset` binds the identities to the referenced assertions. The `response_proof` binds the response to the request.
+|G3 Response destination and redirects
+|`response_uri`, `direct_post`, <<OpenID4VP>> §8.2
+|Profile
+|The device must not return `redirect_uri`; `request_uri` and `response_uri` must share an origin.
+|Yes
 
-|Transport
-|Same-device redirects, cross-device QR with `request_uri`, and the Digital Credentials API.
-|Cross-device QR with HTTPS. BLE is reserved.
+|G4 Exact signer payload
+|`transaction_data`, <<OpenID4VP>> §5.1. `authorization_details`, <<OpenID4VCI>> §5.1.1, <<RFC9396>>
+|Extension
+|None.
+|Yes
+
+|G12 Fail-closed requirements
+|Unknown transaction data types rejected, <<OpenID4VP>> §5.1. Unknown `authorization_details` fields rejected, <<RFC9396>> §5. Unknown request parameters ignored (OAuth); unknown Credential Request and Response parameters ignored, <<OpenID4VCI>> §8.2, §8.3
+|Extension, placed only inside fail-closed containers
+|None.
+|Yes
+
+|G5 Requested disclosures
+|DCQL claims paths and values, <<OpenID4VP>> §6
+|Not sufficient; extension
+|DCQL may mirror `requested`, but is not authoritative.
+|Yes
+
+|G5 Closed property set, COSE header profile
+|None. <<CAWG-IA>> §8.1 permits more.
+|None (a restriction of CAWG)
+|Privacy restriction. Excludes `credentialStatus` and `sigTst2` for now.
+|Yes
+
+|G6 Informed approval
+|Rendering rules for transaction data, <<CSC-DMB>> §6.4, as a model
+|None
+|None.
+|Yes
+
+|G7 Accepted issuers
+|DCQL `trusted_authorities`, <<OpenID4VP>> §6.1 (no DID-list type found). HTTPS Credential Issuer Identifier, <<OpenID4VCI>> §12.2.1
+|Extension, plus a bridging rule
+|The device still trusts DIDs; the HTTPS endpoint is only located by URL.
+|Yes
+
+|ICA issuance inputs
+|`authorization_details` of type `openid_credential`, <<OpenID4VCI>> §5.1.1; PAR, §5.1.4 and <<RFC9126>>; `credential_identifiers`, §6.2
+|Profile and extension
+|The dataset passes through the Authorization Server. The actor authenticates at the issuer.
+|Not applicable (the issuer interface was informative)
+
+|Bearer ICA credential
+|Credentials without key binding, <<OpenID4VCI>> §14.2; no `proof_types_supported`
+|Configuration
+|No wallet key needed.
+|Not applicable
+
+|ICA credential format
+|Credential Format Profiles, <<OpenID4VCI>> Appendix A; format-specific parameters, <<OpenID4VP>> Appendix B
+|Extension (a new format identifier)
+|None.
+|Yes
+
+|G8 Maximum signature size, field and size limits
+|None
+|None
+|None.
+|Yes
+
+|G9 Exact bytes
+|Binary credentials as base64url strings, <<OpenID4VCI>> §8.3. `vp_token` entries, <<OpenID4VP>> §8.1. Padded base64 in <<CSC-DMB>>
+|Profile (encoding)
+|None, if the decoding is exact.
+|Yes
+
+|G10 Request-to-result proof
+|`transaction_data_hashes` in the KB-JWT, <<OpenID4VP>> B.3.3.1; mdoc `DeviceSigned`, B.2.1; `qesApproval`, <<CSC-DMB>> §7.2
+|Not reusable as is; extension
+|Those use a holder key over request data only. None covers the result's digest, or works without a holder-bound credential.
+|Yes
+
+|G10 Current actor authorization at the issuer
+|Authorization code flow with PKCE and consent, <<OpenID4VCI>> §5
+|Profile
+|The person signs in at the issuer for each proof-bearing signing.
+|Not applicable
+
+|G11 Deadline
+|Request Object `iat` and `exp`
+|Configuration, plus the skew rule
+|None.
+|Yes
+
+|Session correlation
+|`state`, <<OpenID4VP>> §5.3
+|Configuration
+|None.
+|Yes
+
+|Remote X.509 key
+|`signatures/signHash`, authorization bound to digests, <<CSC-API>> §11.10, §11.6, §8.4
+|Profile
+|The RSSP holds the key. Ed25519 is not possible. A proof needs a second authorization.
+|Not applicable
+
+|Wallet-facing X.509 signing request
+|X.509 format, `x509MetadataQuery`, `qes` transaction type, <<CSC-DMB>> §6.2, §8
+|Partial: format and query reused; extension for COSE
+|The `cawg` response member needs CSC's agreement.
+|Not applicable
 |===
 
-A future version could express `requested` as a DCQL query, with `cawg.*` types as credential types and fields as claim paths, and define a C2PA client identifier scheme.
-That would let existing OpenID4VP wallets parse the request.
-It would not remove the need for a new credential per asset, which OpenID4VP does not provide.
+[appendix]
+[[extension-inventory]]
+== Extension inventory (informative)
 
-=== OpenID4VCI
+Every identifier below is *proposed*, except those marked implemented.
+The `macawg_` names are placeholders: the namespace (a CAWG-registered URI, or another owner) is an open question, and names will change when it is decided.
 
-In OpenID4VCI, a wallet obtains a credential from an issuer by means of a credential offer, an authorisation step, and a credential request.
-The wallet-to-ICA-issuer step of Macawg (<<issuer-api>>) has the same shape.
-The unsigned ICA credential plays the part of a credential request whose subject data includes `c2paAsset`.
+[cols="3,2,3,2",options="header"]
+|===
+|Identifier |Kind |Where used |Status
 
-A natural design for the issuer API is an OpenID4VCI profile:
+|`macawg://sign` invite, `macawg.sign_request`, `macawg.sign_response` |URI scheme, message types |Binding A |Implemented
+|`application/vnd.macawg.sign-request+json` |COSE content type |Binding A |Implemented
+|`macawg.sign_request.v1` |COSE external AAD, request |Binding A |Implemented
+|`macawg.sign_response.v1` |COSE external AAD, response proof |Binding A, and binding B under A |Implemented
+|`response_proof_unsupported` |Decline reason |All bindings |Implemented (reason text)
+|`macawg.sign_response.oid4vp.v1` |COSE external AAD, response proof |Binding C, and binding B under C |Proposed
+|`macawg_ica_cose` |Credential format identifier |OpenID4VCI `format`; OpenID4VP DCQL `format` and `vp_formats_supported` |Proposed
+|`macawg_issuer_did` |Credential configuration metadata member |OpenID4VCI issuer metadata |Proposed
+|`macawg_signer_payload`, `macawg_verified_identities`, `macawg_max_signature_size`, `macawg_accepted_issuers`, `macawg_response_proof` |`authorization_details` members for type `openid_credential` |OpenID4VCI PAR and Token Response |Proposed
+|`macawg_response_proof` |Credential Response parameter |OpenID4VCI Credential Response |Proposed
+|`macawg_cawg_sign` |Transaction data type, with members `signer_payload`, `max_signature_size`, `requested`, `context` |OpenID4VP `transaction_data` |Proposed
+|`{ "signature", "response_proof" }` |Presentation structure for `macawg_ica_cose` |OpenID4VP `vp_token` |Proposed
+|`cawg` |Member of CSC `x509PresentationResponse` |OpenID4VP with <<CSC-DMB>> |Proposed; needs CSC agreement
+|===
 
-* a credential configuration for `IdentityClaimsAggregationCredential` in COSE (`application/vc`);
-* the `c2paAsset` and the selected `verifiedIdentities` carried as credential request parameters;
-* issuer authentication of the person through the issuer's own authorisation server.
+[appendix]
+[[recommendation]]
+== Recommendation on binding status (informative)
 
-This is left to a future companion document, because the draft issuer API is not yet stable.
+Normative now::
+The operation (<<operation>>), binding A, and local-key X.509 signing.
+These are the parts with a reference implementation and tests.
+G2 (`expected_claim_generator`) remains the release blocker.
+
+Proposed, and the next candidate for normative status::
+Binding B, OpenID4VCI issuance of ICA credentials.
+It uses standard mechanisms with fail-closed extension points, preserves every guarantee, and needs no new credential or key.
+It should become normative after one issuer and one wallet interoperate, using the test vectors in <<impl-tasks>>.
+
+Proposed, limited::
+Binding D remote signing with `signHash`, for ES256, ES384, ES512 and PS256, PS384, PS512 only.
+It cannot support Ed25519, and the response proof costs a second authorization.
+
+Evaluation only::
+Binding C (OpenID4VP) and the CSC Data Model Bindings profile.
+They need a new transaction data type, a new format or response member, a namespace decision, and review by the OpenID and CSC communities.
+A generic OpenID4VP wallet would still not complete the exchange, so binding C does not yet deliver the interoperability that would justify replacing binding A.
+
+[appendix]
+[[impl-tasks]]
+== Implementation tasks and test vectors (informative)
+
+In priority order:
+
+. *G2, `expected_claim_generator`.*
+Add `expected_*` members to the signer payload in c2pa-rs; carry them in `WireSignerPayload`; compute the value on the device; check it in the wallet against the `x5chain` leaf.
+Vectors: a certificate, its deterministic CBOR byte-string encoding, the SHA-256 result, and the JSON wire form; a mismatch case.
+. *Binding A test vectors.*
+Request bytes, protected header, external AAD, `Sig_structure`, signature; response proof payload in deterministic CBOR and its `Sig_structure`, for both modes.
+Rejection cases already in the reference tests, plus a proof made with AAD `macawg.sign_response.v1` presented under binding C (domain separation).
+. *Binding B.*
+Issuer metadata, PAR with the dataset, consent, Token Response, Credential Request by identifier, and Credential Response with `macawg_response_proof`, in the `macawg-wallet` issuer and wallet.
+Vectors and rejection cases: an unknown `authorization_details` member; a Token Response whose `authorization_details` differs; an issued `issuer` that differs from `macawg_issuer_did`; a credential whose identities differ from the dataset; a proof over the wrong digest; a deferred response.
+. *Binding D.*
+COSE assembly around `signHash` for ES256 and PS256.
+Vectors: `ToBeSigned`, its digest, a DER ECDSA signature and its `r‖s` form, the RSASSA-PSS `signAlgoParams` DER, and the final `COSE_Sign1`; an Ed25519 request that must be refused.
+. *Binding C prototype*, only after a namespace decision.
+Vectors: the Request Object compact serialization, its digest, the decoded `macawg_cawg_sign` entry, and the `vp_token`.
+Rejection cases: an unknown member in the entry; a `response_uri` on a different origin from `request_uri`; a response with `redirect_uri`; a missing proof.
+. *Namespace.* Decide who owns the `macawg_` identifiers, and register or rename them.
 
 [appendix]
 == Implementation status (informative)
 
-This table describes the reference implementation, `macawg` 0.2.0.
+This table describes the reference implementation, `macawg` 0.2.0, at commit `d24deaf` of https://github.com/Cognitive-Proof/macawg/pull/1[Cognitive-Proof/macawg#1].
 It separates four things:
 
 Library::
@@ -1414,7 +2257,11 @@ A helper being available does not mean that a given wallet or device calls it.
 |Rejecting `did:jwk` with `"use": "enc"` |Not implemented |Not checked
 |HTTPS binding |Application |`TransportHint::Https` is the hint only; the HTTP server and client are the application's
 |BLE binding |Not implemented |`TransportHint::Ble` placeholder
-|Wallet to issuer API |Out of scope |Draft in `macawg-wallet`
+|Wallet to issuer API |Not implemented |Binding B is proposed; `macawg-wallet` has a draft of its own
+|Binding B (OpenID4VCI issuance) |Not implemented |—
+|Binding C (OpenID4VP) |Not implemented |—
+|Binding D (CSC `signHash`, CSC Data Model Bindings) |Not implemented |—
+|Proof AAD `macawg.sign_response.oid4vp.v1` |Not implemented |—
 |===
 
 [appendix]
@@ -1439,3 +2286,30 @@ Redirect handling belongs to the application's HTTP client.
 * an issued credential with an extra `@context` or `type` entry;
 * a `session_id`, `nonce` or `reason` that breaks <<field-lengths>>;
 * a complete conforming exchange that uses `expected_claim_generator`, once it can be implemented.
+
+[appendix]
+[[changelog]]
+== Change log (informative)
+
+0.5-draft::
+* Separated the CAWG operation, its inputs, result and guarantees G1 to G12, from its transport (<<operation>>).
+* Named the existing exchange binding A, and kept it normative and unchanged on the wire.
+* Defined request representations and AAD domains for the response proof (<<proof-domains>>).
+* Added binding B, OpenID4VCI issuance of ICA credentials, with an immutable dataset in `authorization_details` (proposed).
+* Added binding C, an evaluation of OpenID4VP for the device-to-wallet exchange (proposed).
+* Added binding D, remote X.509 signing with the CSC API, and an evaluation of CSC Data Model Bindings (proposed).
+* Corrected the wallet's `expected_claim_generator` computation: CAWG hashes the certificate as a CBOR byte string.
+* Rewrote the comparison appendix; added the compatibility matrix, extension inventory, recommendation and implementation tasks.
+* Made the examples satisfy the draft, including `expected_claim_generator`, and marked them as intended conformance.
+
+0.4-draft::
+COSE header and structural-value profile, `credentialStatus` limitation, field lengths and size measurement, one acceptance deadline, implementation status by support category.
+
+0.3-draft::
+Response proof request flag and validation, `crit`, closed credential property set, redirect and URL comparison rules, resource maximums.
+
+0.2-draft::
+`session_url`, response proof, wallet release check, unknown `signer_payload` members rejected, CAWG ICA alignment.
+
+0.1-draft::
+First draft.
