@@ -7,9 +7,9 @@
 :sectanchors:
 :icons: font
 :source-highlighter: rouge
-:revnumber: 0.5-draft
+:revnumber: 0.6-draft
 :revdate: 2026-10-14
-:cawg-ia: https://cawg.io/identity/1.2/
+:cawg-ia: https://cawg.io/identity/1.3/
 :c2pa-spec: https://c2pa.org/specifications/specifications/2.2/specs/C2PA_Specification.html
 
 [abstract]
@@ -20,7 +20,7 @@ The claim generator builds a request that contains the CAWG `signer_payload` and
 The wallet verifies the request, obtains a signature (for identity claims aggregation, from a third-party issuer), and returns it.
 The claim generator verifies the response before it places the signature in the identity assertion.
 
-Macawg is a companion to the {cawg-ia}[CAWG Identity Assertion specification, version 1.2].
+Macawg is a companion to the {cawg-ia}[CAWG Identity Assertion specification, version 1.3].
 That specification defines the assertion and its signature types.
 This document defines how the signature travels between the two parties.
 
@@ -94,7 +94,7 @@ The `c2paAsset` in that credential binds it to the assertions that the `signer_p
 
 == Normative references
 
-* [[[CAWG-IA]]] Creator Assertions Working Group, _Identity Assertion_, version 1.2. {cawg-ia}
+* [[[CAWG-IA]]] Creator Assertions Working Group, _Identity Assertion_, version 1.3. {cawg-ia}
 * [[[C2PA]]] C2PA, _C2PA Technical Specification_, version 2.2. {c2pa-spec}
 * [[[RFC2119]]] Bradner, S., _Key words for use in RFCs to Indicate Requirement Levels_, BCP 14, RFC 2119.
 * [[[RFC8174]]] Leiba, B., _Ambiguity of Uppercase vs Lowercase in RFC 2119 Key Words_, BCP 14, RFC 8174.
@@ -265,7 +265,7 @@ The other bindings are proposed, and are described separately in <<binding-b>>, 
 |===
 |Input |Meaning |Binding A member
 
-|Signer payload |The exact CAWG `signer_payload` to be signed, including any `expected_*` members (<<CAWG-IA>> §5.2). |`signer_payload`
+|Signer payload |The exact CAWG `signer_payload` to be signed (<<CAWG-IA>> §5.2). |`signer_payload`
 |Mode |`cawg.identity_claims_aggregation` or `cawg.x509.cose` (<<_signature_types>>). |`signer_payload.sig_type`
 |Claim generator credential |The C2PA signing certificate chain that authenticates the request, and that will sign the claim. |`x5chain` of the request `COSE_Sign1`
 |Requested disclosures |Identity types, fields and providers the device asks for. ICA mode only. |`requested.identities`
@@ -301,7 +301,7 @@ The section references give the binding A rules.
 |Id |Guarantee |Requirement |Binding A
 
 |G1 |Claim generator authentication |The request is integrity-protected and signed with the claim generator's C2PA signing credential. The wallet validates the certificate profile and, in production, the C2PA trust list. |<<request-auth>>, <<trust-modes>>
-|G2 |Claim generator binding |`expected_claim_generator` in the signer payload identifies the certificate that authenticated the request. *(proposed; not implemented)* |<<expected-claim-generator>>
+|G2 |_Withdrawn_ |Was: `expected_claim_generator` identifies the certificate that authenticated the request. Withdrawn in 0.6, because <<CAWG-IA>> 1.3 removed the field (<<claim-generator-substitution>>). The number is kept so that G3 to G12 do not change. |—
 |G3 |Invitation binding |The request is bound to the scanned invitation, and the response goes only to the destination named in the signed request, with no redirects. |<<_nonce_binding>>, <<transport-https>>
 |G4 |Exact payload |The wallet signs, or has issued, exactly the signer payload in the request. Unknown payload members are rejected, never dropped. |<<wire-signer-payload>>, <<extensions>>
 |G5 |Disclosure control |Only requested types, fields and providers; exactly the values the person approved; no other property, header or entry. The wallet checks before release. |<<selective-disclosure>>, <<wallet-release>>
@@ -359,7 +359,7 @@ These rules apply to every binding:
 |===
 |Binding |Between |Status |Implementation
 
-|A, Macawg COSE/HTTPS (<<binding-a>>) |Device and wallet |Normative |macawg 0.2.0; G2 dropped, because CAWG 1.3 removed `expected_claim_generator`
+|A, Macawg COSE/HTTPS (<<binding-a>>) |Device and wallet |Normative |macawg 0.2.0
 |Local-key X.509 signing (<<x509>>) |Inside the wallet |Normative |macawg 0.2.0 (`x509` feature)
 |B, OpenID4VCI ICA issuance (<<binding-b>>) |Wallet and ICA issuer |Proposed |Not implemented
 |C, OpenID4VP (<<binding-c>>) |Device and wallet |Proposed, evaluation only |Not implemented
@@ -500,9 +500,6 @@ The `signer_payload` member is the JSON form of the CBOR `signer_payload` map in
 |`referenced_assertions` |REQUIRED |Array of hashed URIs. Each has `url` (string), `alg` (string, OPTIONAL), and `hash` (base64url).
 |`sig_type` |REQUIRED |One of the values in <<_signature_types>>.
 |`role` |OPTIONAL |Array of role strings. Omitted when empty.
-|`expected_partial_claim` |OPTIONAL |As in <<CAWG-IA>> §6.1.1, with `hash` as base64url. Needed for whole-claim binding (<<binding-scope>>).
-|`expected_claim_generator` |REQUIRED |As in <<CAWG-IA>> §6.1.2, with `hash` as base64url. See <<expected-claim-generator>>.
-|`expected_countersigners` |OPTIONAL |As in <<CAWG-IA>> §6.1.3.
 |===
 
 The device MUST produce `signer_payload` from the same payload that it will place in the identity assertion, so that converting it back to CBOR yields the same map.
@@ -516,10 +513,16 @@ This check is syntactic.
 It catches a device that forgot the hard binding, but the wallet cannot see the claim, so it cannot confirm that the reference names a valid, active hard binding assertion.
 Validators of the asset make that check (<<CAWG-IA>> §7).
 
-NOTE: Implementation status: none of the three `expected_*` members is implemented, so the requirements on them are *(proposed)*.
-The reference implementation does not carry them, and c2pa-rs 0.91, whose `SignerPayload` it mirrors, does not model them.
-Because it does not recognise them, the reference implementation rejects a request that carries them, as <<extensions>> requires.
-It therefore cannot yet process a request that meets the `expected_claim_generator` requirement.
+[[expected-members]]
+==== `expected_*` members are not permitted
+
+Version 1.2 of <<CAWG-IA>> defined three optional members, `expected_partial_claim`, `expected_claim_generator` and `expected_countersigners`.
+Version 1.3 removed them, and says validators MUST ignore them (<<CAWG-IA>> §5.1).
+A member that validators ignore protects nothing, so Macawg does not use them.
+
+A device MUST NOT include any of them in `signer_payload`.
+A wallet receives them as unknown `signer_payload` members, and so MUST reject the request (<<extensions>>, G4, G12).
+_(Traces to `WireSignerPayload`, which denies unknown members.)_
 
 [[requested]]
 === `requested`
@@ -647,11 +650,7 @@ A wallet SHOULD present `context` as the requester's description, not as a verif
       }
     ],
     "sig_type": "cawg.identity_claims_aggregation",
-    "role": ["cawg.creator"],
-    "expected_claim_generator": {
-      "alg": "sha256",
-      "hash": "gVOf2oh5IrwNngepeVV-13bIOAGnUbzEvArJ4JgdBFI"
-    }
+    "role": ["cawg.creator"]
   },
   "max_signature_size": 8192,
   "requested": {
@@ -669,42 +668,8 @@ A wallet SHOULD present `context` as the requester's description, not as a verif
 }
 ----
 
-NOTE: This example shows intended conformance.
-It includes the REQUIRED `expected_claim_generator`, so the reference implementation, macawg 0.2.0, rejects it as an unknown `signer_payload` member (<<extensions>>).
-The hash values are illustrative 32-byte values, not real hashes of an asset or certificate.
-
-[[expected-claim-generator]]
-=== `expected_claim_generator` binding *(proposed)*
-
-<<CAWG-IA>> §6.1.2 lets a `signer_payload` name the claim generator's end-entity certificate through `expected_claim_generator`.
-In Macawg, the device that signs the request is the claim generator, and it signs with the same certificate.
-This gives the wallet a check that the request signer is the party that will sign the claim.
-
-*(proposed)* A device MUST include `expected_claim_generator` in `signer_payload`, computed over the end-entity certificate of its C2PA signing credential as <<CAWG-IA>> §6.1.2 describes.
-
-*(proposed)* A wallet MUST compute the same value over the end-entity certificate in the request's `x5chain` (<<request-auth>>), and MUST reject the request if `expected_claim_generator` is absent or does not match.
-As <<CAWG-IA>> §6.1.2 specifies, the hash input is the certificate encoded as a CBOR byte string in deterministic encoding (<<RFC8949>> §4.2.1), not the bare DER, and the algorithm is the one named in `alg`.
-
-In the JSON form of <<wire-signer-payload>>, `expected_claim_generator` is `{ "alg": <string>, "hash": <base64url> }`.
-In an ICA credential's `c2paAsset`, its `hash` is standard base64, like the other hashes there (<<ica-vc>>).
-
-Without this check, a party that holds any C2PA certificate could sign a request whose `signer_payload` was computed by a different claim generator.
-The person would see one requester's name, while their identity would be attached to another party's claim.
-With this check, the identity assertion is also bound to the claim generator's certificate, so it cannot be moved to a claim signed with a different certificate.
-It still does not bind unreferenced parts of the claim.
-That needs `expected_partial_claim` (<<binding-scope>>).
-
-This rule needs the `expected_*` members to be carried in <<wire-signer-payload>>, and needs claim generators to compute them.
-Neither is implemented in the reference implementation or in c2pa-rs 0.91.
-
-[IMPORTANT]
-.Release blocker
-====
-Because `expected_claim_generator` is REQUIRED, no implementation can yet complete an exchange that conforms to this draft.
-That includes the reference implementation, macawg 0.2.0.
-Implementing this field and its wallet check is the main blocker for a version 1 release.
-Until then, the reference implementation shows that the other rules work, but it does not conform.
-====
+The hash value is an illustrative 32-byte value, not a real hash of an asset.
+The reference implementation's `tests/vectors.rs` uses this example as its binding A request vector (<<test-vectors>>).
 
 [[request-auth]]
 == Request authentication
@@ -791,7 +756,7 @@ It MUST reject the request if any check fails.
 . `max_signature_size` is greater than 0 and no more than 65536.
 . If `requested` is present, `sig_type` is `cawg.identity_claims_aggregation`, and `requested` is well-formed (<<requested>>).
 . The `cose_sign1` is tagged, and its protected header `content type` is `application/vnd.macawg.sign-request+json`.
-. *(proposed)* `expected_claim_generator` matches the `x5chain` end-entity certificate (<<expected-claim-generator>>).
+. _(Withdrawn in 0.6; was the `expected_claim_generator` check. The number is kept so later checks do not change.)_
 . For HTTPS, `session_url` is present and equals the invite's `u` (<<url-comparison>>).
 . If `crit` is present, the wallet recognises and implements every member it names (<<extensions>>).
 . *(proposed)* If `response_proof_required` is `true` and the wallet cannot obtain a response proof, the wallet does not offer to sign (<<response-proof>>).
@@ -997,11 +962,7 @@ The wallet would then check the entry against this structure before release, in 
           "hash": "gZXc8AkKv86pivdlRBEH0f//JnJJGh5EpjvAZZ+tUcU="
         }
       ],
-      "role": ["cawg.creator"],
-      "expected_claim_generator": {
-        "alg": "sha256",
-        "hash": "gVOf2oh5IrwNngepeVV+13bIOAGnUbzEvArJ4JgdBFI="
-      }
+      "role": ["cawg.creator"]
     }
   }
 }
@@ -1009,14 +970,14 @@ The wallet would then check the entry against this structure before release, in 
 
 This credential answers the example request: one `cawg.social_media` identity with exactly the requested `username` and `uri`, and an issuer in `accepted_issuers`.
 The hashes are the request's, in standard base64.
-`expected_claim_generator` in `c2paAsset` is intended conformance; macawg 0.2.0 cannot produce it.
+
 
 `c2paAsset` is the request's `signer_payload`, but its hashes are standard base64 (<<RFC4648>> §4), not base64url, as <<CAWG-IA>> §8.1 requires.
 `role` and `alg` are omitted when absent.
 _(Traces to `ica_vc_json`.)_
 
 NOTE: The `@context` URI is the version 1.1 ICA context.
-This is the URI that <<CAWG-IA>> 1.2 itself uses, and the one that c2pa-rs validators expect.
+This is the URI that <<CAWG-IA>> 1.3 itself uses, and the one that c2pa-rs validators expect.
 
 [[ica-cose]]
 ==== Signature
@@ -1168,11 +1129,7 @@ The proof is not embedded in the asset, so it does not change the published cred
       }
     ],
     "sig_type": "cawg.identity_claims_aggregation",
-    "role": ["cawg.creator"],
-    "expected_claim_generator": {
-      "alg": "sha256",
-      "hash": "gVOf2oh5IrwNngepeVV-13bIOAGnUbzEvArJ4JgdBFI"
-    }
+    "role": ["cawg.creator"]
   },
   "signature": "0oRYJqIBJwN..."
 }
@@ -1433,8 +1390,7 @@ Example, as pushed with PAR:
         { "url": "self#jumbf=c2pa.assertions/c2pa.hash.data", "alg": "sha256", "hash": "gZXc8AkKv86pivdlRBEH0f__JnJJGh5EpjvAZZ-tUcU" }
       ],
       "sig_type": "cawg.identity_claims_aggregation",
-      "role": ["cawg.creator"],
-      "expected_claim_generator": { "alg": "sha256", "hash": "gVOf2oh5IrwNngepeVV-13bIOAGnUbzEvArJ4JgdBFI" }
+      "role": ["cawg.creator"]
     },
     "macawg_verified_identities": [
       {
@@ -1515,8 +1471,8 @@ Status: proposed, for evaluation. Not implemented. Every identifier here is a pl
 |===
 
 `x509_hash` is the base64url SHA-256 of the DER leaf certificate.
-`expected_claim_generator` is a hash of the same certificate encoded as a CBOR byte string (<<CAWG-IA>> §6.1.2), so the two values differ.
-The wallet MUST compute both from the same `x5c` leaf certificate, and check each.
+The wallet MUST check it against the `x5c` leaf certificate (<<OpenID4VP>> §5.9.3).
+Like binding A's `x5chain`, it authenticates the requester (G1); neither binds the requester to the claim's signer (<<claim-generator-substitution>>).
 
 ==== Transaction data type `macawg_cawg_sign` *(proposed)*
 
@@ -1790,27 +1746,34 @@ An attacker who can inject responses can also inject a `declined` response, whic
 [[binding-scope]]
 === What the identity signature binds
 
-The identity signature covers the `signer_payload`: the referenced assertions and their hashes, the `sig_type`, the roles, and any `expected_*` members.
+The identity signature covers the `signer_payload`: the referenced assertions and their hashes, the `sig_type`, and the roles.
 It does not, by itself, cover the rest of the claim.
 
 The required hard binding reference ties the signature to the asset's content.
 However, another claim that contains the same referenced assertions could carry the same identity assertion while it changes, adds, or removes assertions that are not referenced.
 
-* `expected_claim_generator` (<<expected-claim-generator>>) restricts which certificate can sign the claim.
-* `expected_partial_claim` (<<CAWG-IA>> §6.1.1) restricts the claim's structure, including assertions that are not referenced.
-
-Neither is implemented in the reference implementation (<<wire-signer-payload>>).
-
 Referencing an assertion protects that assertion only.
 Referencing every assertion that exists today does not stop another claim from adding an assertion, or from changing claim fields that are outside the referenced assertions.
-Whole-claim binding requires `expected_partial_claim`, which <<CAWG-IA>> §6.1.1 defines as a hash over the claim structure.
-An implementation without it cannot offer that guarantee, and MUST NOT claim to.
 
+<<CAWG-IA>> 1.2 offered `expected_partial_claim` for whole-claim binding and `expected_claim_generator` for the signing certificate.
+Version 1.3 removed both, and states that it defines no mitigation for re-signing by an adversarial claim generator (<<CAWG-IA>> §9.4.7).
+So no Macawg binding can offer whole-claim binding, and an implementation MUST NOT claim to.
+
+[[claim-generator-substitution]]
 === Claim generator substitution
 
-Without <<expected-claim-generator>>, the requester's certificate and the claim's signing certificate are not linked cryptographically.
+The requester's certificate and the claim's signing certificate are not linked cryptographically.
 A trusted but malicious C2PA signer could relay another claim generator's `signer_payload` under its own name.
-The proposed `expected_claim_generator` rule closes this gap.
+Equally, after the identity assertion exists, any claim generator could put it in a new claim that references the same assertions (<<CAWG-IA>> §9.4.7).
+
+This is unmitigated in Macawg version 1, as it is in <<CAWG-IA>> 1.3.
+Earlier drafts of Macawg proposed `expected_claim_generator` (G2) to address it.
+CAWG 1.3 removed that field and tells validators to ignore it, so a check made only by the wallet would prove nothing to anyone who later validates the asset: the device chooses the hash it sends.
+G2 is therefore withdrawn.
+
+What remains is G1: the wallet still authenticates the requester's C2PA certificate, and can show the person who is asking.
+That tells the person who requested the signature, not who will sign the claim.
+A future CAWG mechanism for this threat could be adopted as a new guarantee.
 
 === Issuer trust
 
@@ -1953,7 +1916,6 @@ Most of binding A's transport pattern already exists elsewhere:
 The CAWG-specific contribution is the operation (<<operation>>):
 
 * approval of an exact CAWG `signer_payload`, with unknown members rejected;
-* binding the request's authenticating certificate to `expected_claim_generator` (G2);
 * a disclosure profile for credentials that are published inside an asset (G5): exact values, a closed property set, and fixed COSE headers;
 * issuance of an ICA credential for one asset, during the exchange, with no holder key;
 * a request-to-result proof made with the identity signature's key, over the exact request octets and the exact signature octets (G10);
@@ -2006,10 +1968,10 @@ The last column says whether binding A's wire representation stays unchanged if 
 |Same certificate. The chain is validated against the C2PA trust list. JWS replaces COSE.
 |Yes
 
-|G2 Claim generator binding
-|<<CAWG-IA>> §6.1.2 `expected_claim_generator`. `x509_hash` names the same certificate but hashes DER, not the CBOR byte string.
-|CAWG behavior
-|None. Not implemented anywhere yet.
+|G2 Claim generator binding (withdrawn)
+|None. <<CAWG-IA>> 1.3 removed `expected_claim_generator` and defines no mitigation (§9.4.7).
+|None
+|Claim generator substitution is unmitigated in version 1.
 |Yes
 
 |G3 Invitation nonce
@@ -2160,7 +2122,7 @@ The `macawg_` names are placeholders: the namespace (a CAWG-registered URI, or a
 Normative now::
 The operation (<<operation>>), binding A, and local-key X.509 signing.
 These are the parts with a reference implementation and tests.
-G2 (`expected_claim_generator`) remains the release blocker.
+With G2 withdrawn, nothing in the normative binding is waiting on c2pa-rs.
 
 Proposed, and the next candidate for normative status::
 Binding B, OpenID4VCI issuance of ICA credentials.
@@ -2182,12 +2144,8 @@ A generic OpenID4VP wallet would still not complete the exchange, so binding C d
 
 In priority order:
 
-. *G2, `expected_claim_generator`.*
-Add `expected_*` members to the signer payload in c2pa-rs; carry them in `WireSignerPayload`; compute the value on the device; check it in the wallet against the `x5chain` leaf.
-Vectors: a certificate, its deterministic CBOR byte-string encoding, the SHA-256 result, and the JSON wire form; a mismatch case.
-. *Binding A test vectors.*
-Request bytes, protected header, external AAD, `Sig_structure`, signature; response proof payload in deterministic CBOR and its `Sig_structure`, for both modes.
-Rejection cases already in the reference tests, plus a proof made with AAD `macawg.sign_response.v1` presented under binding C (domain separation).
+. *Binding A test vectors.* Done in `tests/vectors.rs` (<<test-vectors>>).
+Remaining: copy the values into this document.
 . *Binding B.*
 Issuer metadata, PAR with the dataset, consent, Token Response, Credential Request by identifier, and Credential Response with `macawg_response_proof`, in the `macawg-wallet` issuer and wallet.
 Vectors and rejection cases: an unknown `authorization_details` member; a Token Response whose `authorization_details` differs; an issued `issuer` that differs from `macawg_issuer_did`; a credential whose identities differ from the dataset; a proof over the wrong digest; a deferred response.
@@ -2246,7 +2204,7 @@ A helper being available does not mean that a given wallet or device calls it.
 |Not offering to sign when a required proof is unavailable |Application |`check_before_send` refuses to send a `signed` response without one
 |Issuer creates a proof only in an authorized transaction |Application |The issuer service
 |Rejecting `expected_*` members in `signer_payload` |Library |`WireSignerPayload` denies them as unknown members (G4, G12)
-|`expected_claim_generator` binding (G2) |Dropped |CAWG Identity Assertion 1.3 removed `expected_partial_claim`, `expected_claim_generator` and `expected_countersigners`, and tells validators to ignore them, so an asset validator would not enforce G2. c2pa-rs 0.91 models the 1.3 `signer_payload` (contentauth/c2pa-rs#816 is open). The examples in this draft that carry `expected_claim_generator` are rejected.
+|`expected_claim_generator` binding (G2) |Withdrawn |CAWG Identity Assertion 1.3 removed `expected_partial_claim`, `expected_claim_generator` and `expected_countersigners`, and tells validators to ignore them, so an asset validator would not enforce G2. c2pa-rs 0.91 models the 1.3 `signer_payload` (contentauth/c2pa-rs#816 is open). Draft 0.6 withdraws G2 and removes the field from the examples.
 |Unsigned ICA credential and issuance |Library |`UnsignedIcaCredential`
 |Device validation of responses |Library |`check_response`, `verify_ica_credential`
 |No redirects; post only to `session_url` |Application |The wallet's HTTP client
@@ -2268,22 +2226,23 @@ A helper being available does not mean that a given wallet or device calls it.
 |===
 
 [appendix]
+[[test-vectors]]
 == Test vectors
 
-`tests/vectors.rs` in the https://github.com/Cognitive-Proof/macawg[reference implementation] holds the binding A vectors, built from this document's examples with `expected_claim_generator` removed:
+`tests/vectors.rs` in the https://github.com/Cognitive-Proof/macawg[reference implementation] holds the binding A vectors, built from this document's examples:
 
 * the example sign request is exactly the compact-form bytes the device signs, and its base64url hash equals the credential's standard base64 hash;
 * the request `COSE_Sign1`: tag, detached payload, empty unprotected header, the protected header bytes `{1: -8, 3: "application/vnd.macawg.sign-request+json", 33: [end-entity, CA]}`, and the `Sig_structure`, rebuilt from <<RFC9052>> §4.4 and verified with the certificate's key;
 * the ICA response with a fixed Ed25519 issuer key, which makes it deterministic: `request_digest` `f677b250d6435e6a4b4f9b7b2dc37a31fca7ff52de886bb1b27e22d422949520`, the credential's `signature_digest` `a34808a0ef04192a70f929b2d9ade91b9cdcfeaa8aeab5227b76eb713b3d45aa`, the proof payload, its protected header `a10127`, its `Sig_structure`, and the whole proof, whose SHA-256 is `134537d511c85538a379c4ac3d0b36df7b127f3c45ee52a5044e03c8b8ad895f`;
 * the X.509 response proof, checked structurally because the person's key is generated;
 * domain separation: a proof made with AAD `macawg.sign_response.oid4vp.v1` does not verify under binding A;
-* the example request with `expected_claim_generator` is rejected.
+* a request whose `signer_payload` carries `expected_claim_generator` is rejected.
 
 A later draft may copy these values into this appendix.
 `tests/exchange.rs` and `tests/end_to_end.rs` cover full exchanges.
 
 The reference tests also cover an end-to-end exchange with the checks implemented, and these rejection cases.
-All but the redirect and `expected_claim_generator` cases are already tests in the reference implementation: `tests/exchange.rs`, `tests/vectors.rs`, and the unit tests in `src/seal.rs`, `src/ica.rs`, `src/invite.rs` and `src/request.rs`.
+All but the redirect case are already tests in the reference implementation: `tests/exchange.rs`, `tests/vectors.rs`, and the unit tests in `src/seal.rs`, `src/ica.rs`, `src/invite.rs` and `src/request.rs`.
 Redirect handling belongs to the application's HTTP client.
 
 * a `response_proof` whose `request_digest` or `signature_digest` does not match;
@@ -2296,11 +2255,17 @@ Redirect handling belongs to the application's HTTP client.
 * an issued credential with an extra protected or unprotected COSE header parameter;
 * an issued credential with an extra `@context` or `type` entry;
 * a `session_id`, `nonce` or `reason` that breaks <<field-lengths>>;
-* a complete conforming exchange that uses `expected_claim_generator`. Dropped: CAWG 1.3 removed the field.
 
 [appendix]
 [[changelog]]
 == Change log (informative)
+
+0.6-draft::
+* Retargeted to <<CAWG-IA>> 1.3. Section numbers cited from it are unchanged from 1.2.
+* Withdrew G2. CAWG 1.3 removed `expected_partial_claim`, `expected_claim_generator` and `expected_countersigners`, and tells validators to ignore them. They are now rejected as unknown `signer_payload` members (<<expected-members>>).
+* Removed the `expected_claim_generator` section, the release-blocker note, wallet check 15 (its number is kept), and the field from every example.
+* Stated that claim generator substitution and whole-claim binding are unmitigated in version 1, as in CAWG 1.3 (<<claim-generator-substitution>>, <<binding-scope>>).
+* Recorded the binding A test vectors in the reference implementation (<<test-vectors>>).
 
 0.5-draft::
 * Separated the CAWG operation, its inputs, result and guarantees G1 to G12, from its transport (<<operation>>).
@@ -2309,9 +2274,8 @@ Redirect handling belongs to the application's HTTP client.
 * Added binding B, OpenID4VCI issuance of ICA credentials, with an immutable dataset in `authorization_details` (proposed).
 * Added binding C, an evaluation of OpenID4VP for the device-to-wallet exchange (proposed).
 * Added binding D, remote X.509 signing with the CSC API, and an evaluation of CSC Data Model Bindings (proposed).
-* Corrected the wallet's `expected_claim_generator` computation: CAWG hashes the certificate as a CBOR byte string.
 * Rewrote the comparison appendix; added the compatibility matrix, extension inventory, recommendation and implementation tasks.
-* Made the examples satisfy the draft, including `expected_claim_generator`, and marked them as intended conformance.
+* Made the examples satisfy the draft.
 
 0.4-draft::
 COSE header and structural-value profile, `credentialStatus` limitation, field lengths and size measurement, one acceptance deadline, implementation status by support category.
