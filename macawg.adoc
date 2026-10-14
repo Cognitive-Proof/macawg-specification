@@ -7,7 +7,7 @@
 :sectanchors:
 :icons: font
 :source-highlighter: rouge
-:revnumber: 0.6-draft
+:revnumber: 0.7-draft
 :revdate: 2026-10-14
 :cawg-ia: https://cawg.io/identity/1.3/
 :c2pa-spec: https://c2pa.org/specifications/specifications/2.2/specs/C2PA_Specification.html
@@ -36,6 +36,7 @@ Where this document names a crate function, the name is informative.
 The document separates the CAWG signing operation (<<operation>>) from the bindings that carry it.
 Binding A, the Macawg COSE/HTTPS exchange, is normative and implemented.
 Bindings B (OpenID4VCI issuance), C (OpenID4VP) and D (CSC) are proposed, and none is implemented (<<bindings>>, <<recommendation>>).
+A BLE transport for binding A, secured with HPKE, lets a device with no network access take part (<<transport-ble>>, <<offline>>). It and store-and-forward (<<store-and-forward>>) are proposed and not implemented.
 ====
 
 == Introduction
@@ -52,6 +53,7 @@ It specifies:
 
 * the CAWG signing operation: its inputs, its result, and the guarantees every binding must give (<<operation>>);
 * binding A, the normative exchange: an invite URI, a COSE-signed request, wallet checks, a response, device checks, and HTTPS transport (<<binding-a>>);
+* a proposed BLE transport for binding A, secured with HPKE, rules for offline devices, and proposed store-and-forward sessions (<<transport-ble>>, <<offline>>, <<store-and-forward>>);
 * how the wallet produces the signature in each mode (<<ica>>, <<x509>>);
 * proposed alternative bindings: OpenID4VCI issuance of ICA credentials (<<binding-b>>), OpenID4VP for the device-to-wallet exchange (<<binding-c>>), and CSC remote X.509 signing (<<binding-d>>).
 
@@ -110,6 +112,12 @@ The `c2paAsset` in that credential binds it to the assertions that the `signer_p
 * [[[RFC8949]]] Bormann, C. and P. Hoffman, _Concise Binary Object Representation (CBOR)_, RFC 8949.
 * [[[RFC9053]]] Schaad, J., _CBOR Object Signing and Encryption (COSE): Initial Algorithms_, RFC 9053.
 * [[[RFC8230]]] Jones, M., _Using RSA Algorithms with CBOR Object Signing and Encryption (COSE) Messages_, RFC 8230.
+
+The following are normative only for the proposed BLE transport.
+
+* [[[RFC9180]]] Barnes, R., Bhargavan, K., Lipp, B. and C. Wood, _Hybrid Public Key Encryption_, RFC 9180.
+* [[[RFC7748]]] Langley, A., Hamburg, M. and S. Turner, _Elliptic Curves for Security_, RFC 7748.
+* [[[BT-CORE]]] Bluetooth SIG, _Bluetooth Core Specification_, version 6.0. Vol 3, Part F (Attribute Protocol) and Part G (Generic Attribute Profile). https://www.bluetooth.com/specifications/specs/core-specification-6-0/
 
 The following are normative only for the proposed bindings B, C and D.
 
@@ -189,6 +197,14 @@ The CAWG signing operation of <<operation>>, independent of any encoding.
 ==== Binding
 
 A definition of how the operation's inputs and result are encoded and carried, and how its guarantees are met (<<bindings>>).
+
+==== Offline device
+
+A device with no network access during a session (<<offline>>).
+
+==== Store-and-forward session
+
+A BLE session that the device keeps open for up to 7 days, so that a wallet with no network access at the scan can deliver the response later (<<store-and-forward>>).
 
 ==== Request representation
 
@@ -302,7 +318,7 @@ The section references give the binding A rules.
 
 |G1 |Claim generator authentication |The request is integrity-protected and signed with the claim generator's C2PA signing credential. The wallet validates the certificate profile and, in production, the C2PA trust list. |<<request-auth>>, <<trust-modes>>
 |G2 |_Withdrawn_ |Was: `expected_claim_generator` identifies the certificate that authenticated the request. Withdrawn in 0.6, because <<CAWG-IA>> 1.3 removed the field (<<claim-generator-substitution>>). The number is kept so that G3 to G12 do not change. |—
-|G3 |Invitation binding |The request is bound to the scanned invitation, and the response goes only to the destination named in the signed request, with no redirects. |<<_nonce_binding>>, <<transport-https>>
+|G3 |Invitation binding |The request is bound to the scanned invitation, and the response goes only to the destination named in the signed request, with no redirects. |<<_nonce_binding>>, <<transport-https>>, <<ble-destination>>
 |G4 |Exact payload |The wallet signs, or has issued, exactly the signer payload in the request. Unknown payload members are rejected, never dropped. |<<wire-signer-payload>>, <<extensions>>
 |G5 |Disclosure control |Only requested types, fields and providers; exactly the values the person approved; no other property, header or entry. The wallet checks before release. |<<selective-disclosure>>, <<wallet-release>>
 |G6 |Informed approval |The person sees the requester, the context as the requester's description, the roles, and the identity values and their publication, and agrees. |<<wallet-validation>>
@@ -360,6 +376,8 @@ These rules apply to every binding:
 |Binding |Between |Status |Implementation
 
 |A, Macawg COSE/HTTPS (<<binding-a>>) |Device and wallet |Normative |macawg 0.2.0
+|A over BLE with HPKE (<<transport-ble>>) |Device and wallet |Proposed; the next candidate for normative status |Not implemented
+|Store-and-forward over BLE (<<store-and-forward>>) |Device and wallet |Proposed, lower priority |Not implemented
 |Local-key X.509 signing (<<x509>>) |Inside the wallet |Normative |macawg 0.2.0 (`x509` feature)
 |B, OpenID4VCI ICA issuance (<<binding-b>>) |Wallet and ICA issuer |Proposed |Not implemented
 |C, OpenID4VP (<<binding-c>>) |Device and wallet |Proposed, evaluation only |Not implemented
@@ -389,7 +407,7 @@ Its parameters are carried in the query component:
 [source]
 ----
 macawg://sign?v=1&sid=<session id>&n=<nonce>&t=https&u=<session URL>
-macawg://sign?v=1&sid=<session id>&n=<nonce>&t=ble&svc=<service UUID>[&name=<local name>]
+macawg://sign?v=1&sid=<session id>&n=<nonce>&t=ble&svc=<service UUID>&k=<device HPKE public key>[&name=<local name>]
 ----
 
 [cols="1,1,4",options="header"]
@@ -403,6 +421,7 @@ macawg://sign?v=1&sid=<session id>&n=<nonce>&t=ble&svc=<service UUID>[&name=<loc
 |`u` |REQUIRED when `t=https` |The session URL (<<transport-https>>).
 |`svc` |REQUIRED when `t=ble` |BLE GATT service UUID (<<transport-ble>>).
 |`name` |OPTIONAL, `t=ble` only |BLE local name, to help the wallet pick a peripheral.
+|`k` |REQUIRED when `t=ble` *(proposed)* |The device's ephemeral HPKE public key, base64url (<<ble-invite>>).
 |===
 
 Parameter values MUST be percent-encoded as `application/x-www-form-urlencoded` query values.
@@ -428,6 +447,9 @@ A wallet parsing an invite:
 
 _(Traces to `Invite::parse`.)_
 
+*(proposed)* For `t=ble`, a wallet MUST reject an invite whose `k` is missing, or does not decode to exactly 32 bytes.
+The reference implementation does not read `k`, and ignores it.
+
 *(proposed)* Outside of development, a wallet MUST reject a `u` whose scheme is `http`.
 The reference implementation accepts `http` so that devices on a local network can be tested without TLS certificates.
 
@@ -449,7 +471,8 @@ A sign request is a JSON object <<RFC8259>> with these members:
 |`type` |REQUIRED |The string `macawg.sign_request`.
 |`version` |REQUIRED |The protocol version, `1`.
 |`session_id` |REQUIRED |MUST equal the invite's `sid`. 16 to 64 characters from the base64url alphabet (<<field-lengths>>).
-|`session_url` |REQUIRED for HTTPS |The session URL. MUST equal the invite's `u` (<<transport-https>>).
+|`session_url` |REQUIRED for HTTPS; absent for BLE |The session URL. MUST equal the invite's `u` (<<transport-https>>).
+|`session_key` |REQUIRED for BLE; absent for HTTPS *(proposed)* |The device's HPKE public key. MUST equal the invite's `k` (<<ble-destination>>).
 |`nonce` |REQUIRED |MUST equal the invite's `n`. 16 to 64 characters from the base64url alphabet (<<field-lengths>>).
 |`issued_at` |REQUIRED |Timestamp when the device created the request.
 |`expires_at` |REQUIRED |The nominal expiry. The request may be acted on until the acceptance deadline (<<acceptance-deadline>>), and not after.
@@ -459,6 +482,7 @@ A sign request is a JSON object <<RFC8259>> with these members:
 |`context` |OPTIONAL |Descriptive information for display (<<request-context>>).
 |`response_proof_required` |OPTIONAL |Boolean, default `false`. When `true`, the device will accept a `signed` response only with a valid `response_proof` (<<response-proof>>).
 |`crit` |OPTIONAL |Array of top-level member names that the receiver MUST understand (<<extensions>>).
+|`store_and_forward` |OPTIONAL, BLE only *(proposed)* |An object with `lifetime`, in seconds, up to 604800. Asks for a resumable session (<<store-and-forward>>).
 |===
 
 [[extensions]]
@@ -764,7 +788,11 @@ It MUST reject the request if any check fails.
 . `signer_payload` contains no member the wallet does not recognise.
 . The envelope and its parts are within the limits in <<resource-limits>>. The wallet MUST check the envelope size before it decodes it.
 
-_(Checks 1–14, 16, 17 and 19–21 trace to `open_request` and `check_request`. The size check before decoding traces to `RequestEnvelope::from_slice`. For check 18, the reference implementation provides `SignResponse::check_before_send`, which refuses a `signed` response without a proof; the decision not to offer signing is the application's.)_
+. *(proposed)* For BLE, `session_key` is present and equals the invite's `k`, and `session_url` is absent (<<ble-destination>>). For HTTPS, `session_key` is absent.
+. *(proposed)* For BLE, checks 8 and 9 are replaced by the relative-lifetime rules of <<ble-time>>.
+. *(proposed)* If `store_and_forward` is present, the transport is BLE, `lifetime` is from 1 to 604800, `store_and_forward` is listed in `crit`, and the wallet can store and resume the session (<<store-and-forward>>).
+
+_(Checks 1–14, 16, 17 and 19–21 trace to `open_request` and `check_request`. Checks 22 to 24 are not implemented; a request that lists `session_key` or `store_and_forward` in `crit` is rejected by the reference implementation as an unknown critical member. The size check before decoding traces to `RequestEnvelope::from_slice`. For check 18, the reference implementation provides `SignResponse::check_before_send`, which refuses a `signed` response without a proof; the decision not to offer signing is the application's.)_
 
 [[acceptance-deadline]]
 === Acceptance deadline
@@ -783,6 +811,8 @@ It is the single deadline for every party, and every time check in this document
 A request is _expired_ when the current time is later than its acceptance deadline.
 Because `expires_at` is at most 15 minutes after `issued_at`, the acceptance deadline is at most 20 minutes after `issued_at`.
 _(Traces to `SignRequest::check_not_expired`, used by `check_request`, `SignResponse::check_before_send` and `check_response`.)_
+
+Over BLE, the relative deadlines of <<ble-time>> replace this absolute deadline.
 
 The wallet MUST check the acceptance deadline again immediately before it sends a `signed` response, and MUST NOT send one after it.
 The person may take a long time to decide.
@@ -1147,7 +1177,7 @@ It MUST reject the response if any check fails.
 . `type` is `macawg.sign_response`.
 . `version` is supported.
 . `session_id` and `nonce` equal those of the request the device sent.
-. The current time is no later than the request's acceptance deadline (<<acceptance-deadline>>).
+. The current time is no later than the request's acceptance deadline (<<acceptance-deadline>>), or, over BLE, the device's deadline in <<ble-time>>.
 . If `status` is `declined`, the session ends without a signature.
 . `signer_payload` equals the request's `signer_payload`.
 . The decoded `signature` is no longer than `max_signature_size`.
@@ -1261,14 +1291,367 @@ _(Traces to `check_session_url`, called from `Invite::parse`, `seal_request` and
 The request, which does contain the nonce, is protected by TLS.
 
 [[transport-ble]]
-=== Bluetooth Low Energy (placeholder)
+=== Bluetooth Low Energy *(proposed)*
 
-When the invite has `t=ble`, the device is a BLE peripheral that advertises the GATT service `svc`, and MAY advertise the local name `name`.
-_(Traces to `TransportHint::Ble`.)_
+This transport lets a device with no network access run binding A.
+The wallet reaches the device over BLE, and only the wallet needs the internet, to reach the ICA issuer.
+It carries the same request envelope and sign response as HTTPS, so the operation's guarantees and the validation rules of <<wallet-validation>> and <<device-validation>> apply unchanged, except where <<ble-time>> replaces the time checks and <<ble-destination>> replaces the `session_url` check.
 
-This draft does not define the GATT characteristics, how messages are fragmented, or link security.
-A future version will define them.
-Until then, BLE is not interoperable.
+The link is secured with HPKE (<<RFC9180>>), keyed from the QR code.
+It does not use BLE pairing or bonding.
+
+Status: proposed. Not implemented. Every identifier in this section is proposed; the UUIDs are placeholders (<<extension-inventory>>).
+
+[[ble-invite]]
+==== Invite and request members
+
+A BLE invite carries the device's ephemeral HPKE public key in the parameter `k` *(proposed)*:
+
+[source]
+----
+macawg://sign?v=1&sid=q2b9Yv0rN4kM1pQyHk3ZtA&n=8m2cR0xV7JpLwE5uT1aGsQ&t=ble&svc=<service UUID>&k=hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo
+----
+
+`k`::
+REQUIRED when `t=ble`. The base64url encoding of the device's X25519 public key, `pkD`: exactly 43 characters, for 32 bytes (<<RFC9180>> §7.1.1).
+The device MUST generate a fresh key pair, `(skD, pkD)`, for each session.
+The example value is the X25519 public key of <<RFC7748>> §6.1, used here for illustration only.
+
+The signed request for a BLE session carries the same key:
+
+`session_key` *(proposed)*::
+REQUIRED when the transport is BLE, and absent otherwise. The base64url encoding of `pkD`.
+It is covered by the device's COSE signature, as `session_url` is for HTTPS.
+The device SHOULD list `session_key` in `crit` (<<extensions>>), so that a wallet that does not implement this transport rejects the request instead of ignoring the key.
+
+`session_url` MUST be absent from a BLE request.
+
+[[ble-destination]]
+==== Destination binding
+
+For HTTPS, the wallet checks that the signed `session_url` equals the scanned `u`, and posts only there (G3).
+For BLE, the equivalent is the key:
+
+* The wallet MUST check that the decoded `session_key` equals the decoded `k` from the invite, byte for byte.
+* The wallet MUST seal every message to the device with `pkD` (<<ble-hpke>>), and with no other key.
+
+Only the device that holds `skD` can open the response.
+Because `session_key` is under the device's signature, an attacker who shows a QR code with their own key, and relays the device's genuine request, fails this check.
+This is the BLE form of the proxy attack in <<relay>>.
+
+[[ble-gatt]]
+==== GATT service
+
+The device is the GATT server, and advertises the 128-bit service UUID `svc` from the invite.
+The wallet is the GATT client.
+The service has three characteristics *(proposed; placeholder UUIDs)*:
+
+[cols="2,3,2,4",options="header"]
+|===
+|Characteristic |UUID |Properties |Carries
+
+|Key exchange |`6d616361-7767-4001-8000-000000000001` |Write |`HELLO` frames, wallet to device
+|Request |`6d616361-7767-4001-8000-000000000002` |Notify |`REQUEST`, `RESULT` and `ERROR` frames, device to wallet
+|Response |`6d616361-7767-4001-8000-000000000003` |Write |`RESPONSE` and `ERROR` frames, wallet to device
+|===
+
+* Writes MUST use Write Characteristic Value, which the server acknowledges (Bluetooth Core <<BT-CORE>> Vol 3, Part G, §4.9.3). Write Without Response MUST NOT be used, because it gives the sender no flow control.
+* The device sends with notifications (Part G, §4.10). The wallet MUST enable them through the Client Characteristic Configuration Descriptor before it writes a `HELLO`.
+* The characteristics MUST NOT require link-layer encryption or authentication, because the binding does not pair. The device MAY accept link-layer encryption if the wallet sets it up, but neither side relies on it.
+
+[[ble-framing]]
+==== Framing and fragmentation
+
+Each message is a _frame_:
+
+[cols="1,1,4",options="header"]
+|===
+|Field |Size |Meaning
+|`version` |1 byte |`0x01`
+|`type` |1 byte |`0x01` HELLO, `0x02` REQUEST, `0x03` RESPONSE, `0x04` RESULT, `0x7F` ERROR
+|`length` |4 bytes |Length of `body`, unsigned big-endian
+|`body` |`length` bytes |As defined for the type
+|===
+
+A frame is sent as a sequence of fragments.
+Each fragment is one characteristic write, or one notification, of at most `ATT_MTU − 3` bytes, the largest value a write request or a notification can carry (<<BT-CORE>> Vol 3, Part F, §3.4.5.1, §3.4.7.1).
+Fragments are the frame's bytes in order, with no header of their own.
+The receiver concatenates fragments until it has read the 6-byte header and then `length` more bytes.
+The next fragment begins the next frame.
+
+* The default LE `ATT_MTU` is 23 (<<BT-CORE>> Vol 3, Part G, §5.2.1), which gives 20-byte fragments. The wallet SHOULD run the Exchange MTU procedure (Part G, §4.3.1) before it writes a `HELLO`; ATT then uses the smaller of the two sides' receive MTUs (Part F, §3.4.2.2).
+* Fragments never exceed `ATT_MTU − 3`, so no fragment needs the long-write procedures, and no value comes near the 512-byte limit on attribute values (Part F, §3.2.9).
+* A receiver MUST check `version`, `type` and `length` as soon as it has the header, and abort if `length` exceeds the frame maximum: 1 MiB plus 48 bytes for REQUEST, 128 KiB plus 16 bytes for RESPONSE, and 4 KiB for the other types (<<resource-limits>>).
+* A receiver MUST abort if more than 30 seconds pass between fragments of one frame. This matches the ATT transaction timeout (Part F, §3.3.3).
+
+Throughput at small MTUs is low, so a device SHOULD keep BLE request envelopes small. In particular, it SHOULD keep any `context.thumbnail` under 16 KiB.
+
+[[ble-hpke]]
+==== HPKE
+
+All `body` contents, except `ERROR`, are protected with HPKE base mode (`mode_base`, <<RFC9180>> §5.1.1) and this mandatory suite:
+
+[cols="2,2,1",options="header"]
+|===
+|Component |Algorithm |Identifier
+|KEM |DHKEM(X25519, HKDF-SHA256) |`0x0020`
+|KDF |HKDF-SHA256 |`0x0001`
+|AEAD |ChaCha20Poly1305 |`0x0003`
+|===
+
+There is no negotiation: protocol version 1 over BLE uses only this suite, so there is nothing to downgrade.
+
+Why this suite::
+* An X25519 public key is 32 bytes (`Npk` = 32, <<RFC9180>> §7.1), which is 43 base64url characters in the QR code. A P-256 key would be 65 bytes and 87 characters.
+* X25519 and ChaCha20-Poly1305 are easy to implement in constant time in software. Many camera microcontrollers have no AES acceleration, where AES-GCM is slower or harder to make side-channel safe.
+* HKDF-SHA256 matches the SHA-256 hashing used elsewhere in Macawg.
+
+AES-128-GCM would be equally secure. A later version could add it as an option, but only with a negotiation design that cannot be downgraded.
+
+HPKE contexts are one-way (<<RFC9180>> §5.2), so the binding uses two: one from wallet to device, sealed to `pkD`, and one from device to wallet, sealed to a key the wallet sends.
+The `info` strings bind both contexts to the session:
+
+----
+info_w2d = "macawg.ble.v1 wallet-to-device " || sid || " " || nonce
+info_d2w = "macawg.ble.v1 device-to-wallet " || sid || " " || nonce
+----
+
+Here `sid` and `nonce` are the invite's values as ASCII. They contain only base64url characters (<<field-lengths>>), so a space separates them without ambiguity.
+The AAD of every `Seal` and `Open` is the frame's 6-byte header.
+
+<<RFC9180>> treats `info` as application context, not as a secret.
+Including the nonce still means that a party without the invite derives different keys, so its messages fail to open.
+That gates the exchange on possession of the QR code, as fetching the HTTPS session URL does.
+Confidentiality rests on the X25519 keys, not on the nonce.
+The nonce has only 128 bits, below the 32 bytes of entropy that HPKE's PSK mode requires (<<RFC9180>> §5.1.2), so the binding does not use PSK mode.
+
+==== Message flow
+
+[cols="1,1,5",options="header"]
+|===
+|Frame |Direction |`body`
+
+|HELLO |Wallet to device on Key exchange
+|`sid_len` (1 byte), `sid` (ASCII), `enc_w` (32 bytes), and `Seal(aad, pkW)` (48 bytes). The wallet generates a fresh key pair `(skW, pkW)` for each connection, and runs `SetupBaseS(pkD, info_w2d)` to get `enc_w` and its context.
+
+|REQUEST |Device to wallet on Request
+|`enc_d` (32 bytes) and `Seal(aad, envelope)`. The device opens the HELLO with `SetupBaseR(enc_w, skD, info_w2d)`, then runs `SetupBaseS(pkW, info_d2w)`. `envelope` is the request envelope JSON, exactly as an HTTPS `GET` would return it.
+
+|RESPONSE |Wallet to device on Response
+|`Seal(aad, response)` with the wallet-to-device context. `response` is the sign response JSON, exactly as an HTTPS `POST` would carry it.
+
+|RESULT |Device to wallet on Request
+|`Seal(aad, result)` with the device-to-wallet context. `result` is `{"result":"accepted"}`, or `{"result":"rejected","error":<code>}`. This plays the part of the HTTPS status code.
+
+|ERROR |Either direction
+|One byte of error code, unencrypted (<<ble-errors>>).
+|===
+
+The device looks up the session by the plaintext `sid` in the HELLO.
+`sid` is not secret: it is in the QR code, and binding A sends it in clear in the URL path.
+The nonce never travels in clear.
+
+Each context seals in order, and the receiver opens in order (<<RFC9180>> §9.7.1).
+Any lost, duplicated or reordered fragment makes the next `Open` fail.
+HPKE does not tolerate lost messages, and the application must then discard the context (<<RFC9180>> §9.7.1).
+So any `Open` failure aborts the connection.
+
+A device MAY accept HELLOs from more than one wallet in a session, as an HTTPS device serves the request to anyone who has the URL.
+Each connection has its own pair of contexts.
+<<session-state>> still allows only one accepted `signed` response.
+
+A wallet MAY disconnect after the REQUEST while the person decides, and reconnect later with a new HELLO and a new `(skW, pkW)`, until the acceptance deadline.
+On every connection the device sends the REQUEST again.
+The wallet MUST check that it is byte-for-byte the envelope it already holds, and abort if not.
+
+[[ble-errors]]
+==== Errors and abort
+
+An `ERROR` frame has a one-byte code: `0x01` unknown session, `0x02` HELLO failed to open, `0x03` frame too large, `0x04` `Open` failed, `0x05` busy, `0x06` expired.
+It is not authenticated, because it may be sent before any keys exist.
+A receiver MUST treat it only as a hint to stop.
+It MUST NOT end a session because of one: anyone in radio range can send it, so a forged one would be an easy way to deny service (<<session-state>>).
+
+To abort, a side sends an `ERROR` frame if it can, discards both HPKE contexts and any partial frame, and disconnects.
+A new connection always starts with a new HELLO.
+A rejected RESPONSE (`RESULT` with `"rejected"`) leaves the session open, as a 4xx does in <<transport-https>>.
+
+[[ble-vs-tls]]
+==== What HPKE replaces from TLS
+
+Binding A over HTTPS relies on TLS to hide the request, which carries the nonce, the context and any thumbnail, and to hide the response, which carries the disclosed identities.
+
+[cols="2,3,3",options="header"]
+|===
+|Property |HTTPS |BLE
+
+|Request confidentiality |TLS |Sealed to `pkW`. Only a holder of the invite can complete a HELLO and receive it.
+|Response confidentiality |TLS |Sealed to `pkD` from the QR code. Only the device that holds `skD` can open it.
+|Integrity in transit |TLS |The AEAD, as well as the COSE signature on the request and the identity signature in the response.
+|Destination binding (G3) |`session_url` equals `u`; no redirects |`session_key` equals `k` (<<ble-destination>>)
+|Order and replay within a connection |TLS record sequence |HPKE sequence numbers; new contexts on every connection
+|Forward secrecy |TLS 1.3 ephemeral key exchange |Both key pairs are ephemeral, and are deleted when the session ends. Store-and-forward keeps `skD` longer (<<store-and-forward>>).
+|Client authentication |None |None. HPKE base mode does not authenticate the sender (<<RFC9180>> Table 6). The wallet is gated only by knowing the invite.
+|===
+
+Device authentication is unchanged: it is the C2PA COSE signature on the request (G1), in both transports.
+
+[[ble-time]]
+==== Time checks over BLE
+
+An offline device may have no reliable wall clock, so over BLE the wallet treats `issued_at` and `expires_at` as a relative lifetime, `W = expires_at − issued_at`, and does not compare either with its own clock.
+These rules replace wallet checks 8 and 9 (<<wallet-validation>>) and the acceptance deadline (<<acceptance-deadline>>) for BLE sessions.
+The HTTPS transport keeps the absolute checks, because an HTTPS device is reachable over a network and can usually keep its clock set.
+
+* `W` MUST be greater than 0 and at most 15 minutes (check 19).
+* The device MUST NOT send a REQUEST more than `W` after it created the request, measured on its own clock.
+* The wallet's deadline is `t_receipt + W + L`, where `t_receipt` is the wallet's time when it first received the REQUEST, and `L` is the store-and-forward lifetime, or 0 (<<store-and-forward>>). The wallet MUST NOT send a `signed` response after it.
+* The device's deadline is `t_create + 2W + L + 5 minutes`, on its own clock. The device MUST NOT accept a response after it, and MUST discard the session after it.
+* The device MUST measure these times with a clock that does not jump, such as a monotonic clock, or a real-time clock that is not adjusted during the session.
+
+Because the device sent the REQUEST within `W` of creating it, `t_receipt` is at most `t_create + W`, so the wallet's deadline always comes before the device's, apart from clock-rate drift, which the 5 minutes cover.
+Freshness comes from the nonce: the wallet accepts only a request that carries the nonce from the QR code it just scanned, which nobody could have known before the device made it.
+
+Without store-and-forward, a BLE session can last up to `2W + 5` minutes, at most 35 minutes, compared with 20 minutes over HTTPS.
+
+[[offline]]
+== Offline devices *(proposed)*
+
+A device is _offline_ when it has no network access during a session.
+The main case is an offline camera with an online phone, using the BLE transport (<<transport-ble>>).
+Only the wallet needs the internet, to check the C2PA trust list and to reach the ICA issuer.
+
+=== What an offline device must be able to do
+
+An offline device MUST be able to run every check of <<device-validation>> with no network access.
+
+Signing the request::
+Needs only the device's C2PA credential. Unchanged.
+
+ICA issuer keys::
+The device must find the issuer's Ed25519 key without the network (<<device-ica>>).
+`did:jwk` issuers resolve locally.
+For any other DID, the device MUST have the issuer's key provisioned in advance, for each DID in `accepted_issuers`, or MUST have a resolver that works offline, such as a cached DID document with a defined maximum age.
+A `did:web` issuer that the device cannot resolve offline MUST NOT be in `accepted_issuers` for an offline session.
+_(The reference implementation resolves `did:jwk` locally (`DidJwkResolver`); provisioned keys fit its `IssuerKeyResolver` trait.)_
+
+X.509 identity signatures::
+The certificate-profile check works offline. Trust and revocation of the person's certificate need the network; the device MAY leave them to validators of the asset, as <<device-x509>> already allows.
+
+Response proofs::
+Use only keys the device already has: the issuer key above, or the X.509 certificate in the identity signature. Unchanged.
+
+=== Time on an offline device
+
+An offline device's clock may be unset, or may drift.
+Over BLE, the time checks of <<ble-time>> depend only on durations, measured separately on each side.
+
+The ICA validity check needs one more rule.
+<<device-ica>> compares `validFrom` and `validUntil` with the device's clock.
+A device whose clock is not known to be correct, for example because it has never been set from a trusted source:
+
+* MUST NOT reject a credential because `validFrom` is later than its clock, or because `validUntil` is earlier;
+* MUST still require `validFrom` to be present, and `validUntil`, if present, to be later than `validFrom`.
+
+Freshness then comes from the nonce and, when required, the response proof.
+Validators of the asset still check the credential's validity period (<<CAWG-IA>> §8.1.5.2.6).
+_(Not implemented: the reference implementation always compares `validFrom` and `validUntil` with its clock.)_
+
+[[store-and-forward]]
+== Store-and-forward *(proposed)*
+
+Store-and-forward covers the case where neither the device nor the wallet has the internet when the person scans the invite.
+The device keeps the session open for a long time.
+The wallet stores the request, obtains the signature once it is online, and reconnects to the device over BLE to deliver it.
+
+Status: proposed, and lower priority than the BLE transport. Not implemented.
+
+=== Requesting it
+
+A device asks for a resumable session with a request member:
+
+`store_and_forward` *(proposed)*::
+An object with one member, `lifetime`: an integer number of seconds from 1 to 604800 (7 days). This is `L` in <<ble-time>>.
+
+* `store_and_forward` is allowed only for the BLE transport.
+* The device MUST list it in `crit`, so that a wallet that cannot store and resume rejects the request instead of answering too late.
+* The 15-minute limit on `W` (check 19) still applies: the wallet must receive the request soon after the scan. Only the time to deliver a response is extended.
+
+=== At the scan
+
+The wallet:
+
+. validates the request as usual, except that it cannot check the C2PA trust list online. It MUST use a cached trust list, and MUST NOT treat the requester as trusted if its cached list is older than its policy allows;
+. shows the person the request and the identities, and that the signature will be completed later, and obtains their approval (G6);
+. stores the request envelope bytes, the invite's `sid`, `n`, `svc` and `k`, `t_receipt`, and the person's approved selection, protected at rest;
+. does not store `skW`. Each later connection uses a new key pair.
+
+The device persists, so that a power cycle does not lose them:
+
+* `sid`, the nonce, and `skD`. The device SHOULD keep `skD` in protected storage, such as a secure element;
+* the request bytes it sent, which it needs for the response proof and for check 6 of <<device-validation>>;
+* `t_create`, and enough clock state to measure elapsed time across a power cycle. A device that cannot measure elapsed time reliably after a restart MUST discard its pending sessions;
+* the asset and its unfinished claim, exactly as they were when it computed the `signer_payload`, including the space reserved for the identity assertion;
+* a _finished_ flag, written atomically with accepting a response.
+
+=== Completing
+
+Once online, the wallet obtains the signature: an ICA credential through binding B, or an X.509 signature.
+The issuer's authorization of the actor happens at this point, so a required response proof still reflects current authorization (<<_producing_a_proof_for_ica>>).
+The proof's `request_digest` is over the stored request bytes.
+The wallet SHOULD remind the person what they approved before it starts issuance.
+
+The wallet then reconnects:
+
+. It scans for `svc`, connects, and writes a HELLO with the stored `sid` and a new `(skW, pkW)`.
+. The device finds the session by `sid`, and opens the HELLO with the stored `skD` and nonce.
+. The device sends the REQUEST again. The wallet MUST check that it equals the stored bytes, which shows it has reached the same session.
+. The wallet sends the RESPONSE, and the device answers with a RESULT.
+
+The device SHOULD advertise `svc` while it has pending sessions, and MAY require a user action to start advertising, to save power.
+
+=== Rejecting a reply the device can no longer use
+
+If the device still holds `skD` for the session, but can no longer use a signature, it MUST answer the RESPONSE with a sealed RESULT `{"result":"rejected","error":"session_unusable"}`.
+For example, the asset or claim was deleted or changed, or the session expired or finished.
+Because the RESULT is sealed, the wallet can trust it, and MUST then delete its stored state.
+
+A device that no longer holds the session cannot open the HELLO.
+It sends an unauthenticated `ERROR` with code `0x01`.
+The wallet MAY retry until its own deadline, and MUST then delete its stored state.
+
+A device SHOULD keep `sid`, the nonce and `skD` until its deadline, even after it discards the asset, so that it can still send the sealed rejection.
+
+=== Risks
+
+Replay::
+The device accepts at most one `signed` response per session, and the persisted finished flag makes this survive restarts.
+A captured RESPONSE cannot be replayed on another connection, because every connection uses new HPKE contexts.
+A replayed HELLO gets the replayer nothing: the device seals the REQUEST to the `pkW` inside it, which the replayer cannot open.
+Reuse of an older identity signature for the same `signer_payload` is covered by the response proof, as in every binding (G10). Devices SHOULD set `response_proof_required` for resumable sessions.
+
+Lost session::
+If the device loses its stored state, the wallet learns this only from an unauthenticated `ERROR`, and gives up at its deadline.
+If the wallet loses its state, the device discards the session at its deadline.
+In both cases the device must decide what to do with the asset.
+Signing the claim without the identity assertion changes the claim, and is outside this specification.
+
+Size reservation::
+`max_signature_size`, and the claim layout that reserves space for the signature, were fixed when the device computed the `signer_payload`.
+The device MUST NOT change the claim or any referenced assertion while the session is pending.
+The issuer and the device both check the size against the stored `max_signature_size`, as for any session.
+
+Key exposure::
+`skD` lives for up to 7 days.
+Anyone who obtains it can open a captured RESPONSE, and so read the disclosed identities, and can complete HELLOs.
+The lifetime limit bounds the exposure, and protected storage reduces it.
+
+Stale approval::
+Days may pass between the person's approval and issuance.
+The issuer's fresh authorization of the actor, which binding B requires when a proof is requested, confirms the person still agrees.
+
+Privacy::
+The wallet holds the request, including any thumbnail, for up to 7 days, and the device advertises a stable `svc` meanwhile.
 
 [[binding-b]]
 == Binding B: OpenID4VCI issuance of ICA credentials *(proposed)*
@@ -1710,6 +2093,7 @@ Because the device signs the nonce, an attacker cannot pass off a request from a
 
 Scanning an invite proves possession of the invitation, not physical proximity to the device.
 Anyone who can see the code can read the nonce.
+Over BLE, the wallet must also be within radio range of the device when it connects, but BLE links can be relayed, so this is not a proximity guarantee either.
 An attacker does not need to create a signature: they can fetch the device's signed request and relay it.
 
 Two relay attacks follow:
@@ -1829,11 +2213,14 @@ A receiver MUST reject an input that exceeds them, and MUST check sizes as recei
 |`nonce`, `n` |16 to 64 characters from the base64url alphabet; at least 128 bits of entropy (<<invite>>)
 |`reason` |At most 256 bytes of UTF-8
 |`version` |The integer `1`
+|`k`, `session_key` *(proposed)* |Exactly 43 characters from the base64url alphabet, decoding to 32 bytes
 |===
 
 A receiver MUST reject a message in which any of these fields breaks its limit.
 Restricting `session_id` and `nonce` to the base64url alphabet also means they never need JSON escapes or percent-encoding.
 _(Traces to `check_token` and `TOKEN_LENGTH`, called from `Invite::parse`, `seal_request`, `check_request` and `check_response`, and to `MAX_REASON_SIZE`, checked by `SignResponse::check_before_send` and `check_response`. `Invite::parse` requires `v` to be exactly the string `1`.)_
+
+Over BLE, the frame maximums of <<ble-framing>> apply these limits before decryption.
 
 ==== How sizes are measured
 
@@ -1893,6 +2280,14 @@ The request `context` can contain a thumbnail of the asset.
 Anyone who can fetch the session URL can see it, so *(proposed)* the device SHOULD keep session URLs unguessable and short-lived.
 
 A `declined` response tells the device only that the person refused.
+
+=== BLE advertising
+
+A device advertising `svc` can be detected, and tracked if `svc` or its BLE address stays the same.
+*(proposed)* A device SHOULD use a new random `svc` for each session, or rotate it when no session is pending.
+It SHOULD use a resolvable or non-resolvable private address rather than its public address, and SHOULD advertise only while a session is pending.
+The optional `name` is visible to anyone in radio range; a device SHOULD NOT put the owner's name in it.
+Store-and-forward keeps `svc` stable for the session's lifetime (<<store-and-forward>>).
 
 [appendix]
 [[comparison]]
@@ -2087,6 +2482,42 @@ The last column says whether binding A's wire representation stays unchanged if 
 |Partial: format and query reused; extension for COSE
 |The `cawg` response member needs CSC's agreement.
 |Not applicable
+
+|BLE transport
+|GATT characteristics, Write Characteristic Value and notifications, <<BT-CORE>> Vol 3, Part G, §4.9.3, §4.10; MTU exchange, Part F, §3.4.2
+|Profile: a Macawg-defined service and framing
+|No pairing. Throughput limits the request size.
+|Yes, apart from `session_key` replacing `session_url`
+
+|Link confidentiality without TLS
+|HPKE base mode, <<RFC9180>> §5.1.1, with one fixed suite
+|Configuration
+|Keys come from the QR code instead of a certificate. The wallet is not authenticated, as with TLS without client certificates.
+|Yes: the same JSON is sealed
+
+|G3 destination over BLE
+|None
+|Extension (`k` and `session_key`)
+|Replaces the URL comparison.
+|`session_key` added
+
+|Offline issuer keys
+|`did:jwk`, <<DID-JWK>>
+|Configuration
+|`did:web` needs provisioned keys or an offline resolver.
+|Yes
+
+|Offline time checks
+|None
+|None (relative lifetime)
+|Over BLE, the wallet no longer compares the device's timestamps with its own clock.
+|Yes; the rule changes only for BLE
+
+|Store-and-forward
+|None. OpenID4VCI deferred issuance, <<OpenID4VCI>> §9, is an issuer-to-wallet analogue only
+|None
+|Keys and the request are stored for days.
+|`store_and_forward` added
 |===
 
 [appendix]
@@ -2113,6 +2544,13 @@ The `macawg_` names are placeholders: the namespace (a CAWG-registered URI, or a
 |`macawg_cawg_sign` |Transaction data type, with members `signer_payload`, `max_signature_size`, `requested`, `context` |OpenID4VP `transaction_data` |Proposed
 |`{ "signature", "response_proof" }` |Presentation structure for `macawg_ica_cose` |OpenID4VP `vp_token` |Proposed
 |`cawg` |Member of CSC `x509PresentationResponse` |OpenID4VP with <<CSC-DMB>> |Proposed; needs CSC agreement
+|`k` |Invite parameter |BLE transport |Proposed
+|`session_key` |Request member |BLE transport |Proposed
+|`store_and_forward`, with `lifetime` |Request member |BLE store-and-forward |Proposed
+|`6d616361-7767-4001-8000-000000000001` to `…0003` |GATT characteristic UUIDs (placeholders) |BLE transport |Proposed
+|Frame types `0x01` to `0x04`, `0x7F`; error codes `0x01` to `0x06` |Frame format |BLE transport |Proposed
+|`macawg.ble.v1 wallet-to-device`, `macawg.ble.v1 device-to-wallet` |HPKE `info` prefixes |BLE transport |Proposed
+|`{"result": ...}`, `session_unusable` |RESULT body, error code |BLE transport and store-and-forward |Proposed
 |===
 
 [appendix]
@@ -2124,7 +2562,11 @@ The operation (<<operation>>), binding A, and local-key X.509 signing.
 These are the parts with a reference implementation and tests.
 With G2 withdrawn, nothing in the normative binding is waiting on c2pa-rs.
 
-Proposed, and the next candidate for normative status::
+Proposed, and the next candidates for normative status::
+The BLE transport with HPKE, because it covers the main offline case: an offline camera with an online phone.
+It changes no message, only the link, so the validation rules and guarantees carry over.
+It should become normative after two independent implementations pass the BLE test vectors in <<impl-tasks>>.
++
 Binding B, OpenID4VCI issuance of ICA credentials.
 It uses standard mechanisms with fail-closed extension points, preserves every guarantee, and needs no new credential or key.
 It should become normative after one issuer and one wallet interoperate, using the test vectors in <<impl-tasks>>.
@@ -2132,6 +2574,10 @@ It should become normative after one issuer and one wallet interoperate, using t
 Proposed, limited::
 Binding D remote signing with `signHash`, for ES256, ES384, ES512 and PS256, PS384, PS512 only.
 It cannot support Ed25519, and the response proof costs a second authorization.
+
+Proposed, lower priority::
+Store-and-forward, for when neither side is online at the scan.
+It keeps keys and requests for days, and needs persistence on the device, so it should follow the BLE transport, not precede it.
 
 Evaluation only::
 Binding C (OpenID4VP) and the CSC Data Model Bindings profile.
@@ -2155,6 +2601,12 @@ Vectors: `ToBeSigned`, its digest, a DER ECDSA signature and its `r‖s` form, t
 . *Binding C prototype*, only after a namespace decision.
 Vectors: the Request Object compact serialization, its digest, the decoded `macawg_cawg_sign` entry, and the `vp_token`.
 Rejection cases: an unknown member in the entry; a `response_uri` on a different origin from `request_uri`; a response with `redirect_uri`; a missing proof.
+. *BLE transport.*
+A GATT server on a device and a client in the wallet; framing; HPKE with the fixed suite; `k` and `session_key`; the relative time checks; the offline issuer-key and validity rules.
+Vectors, made deterministic with HPKE `DeriveKeyPair` from fixed seeds (<<RFC9180>> §7.1.3): `skD`, `pkD`, `skW`, `pkW` and the ephemeral keys; `info_w2d` and `info_d2w` for the example `sid` and nonce; the HELLO, REQUEST, RESPONSE and RESULT frames for the binding A example messages; the same frames fragmented at `ATT_MTU` 23 and 247.
+Rejection cases: a HELLO sealed with the wrong nonce; a `session_key` that differs from `k`; a RESPONSE replayed on a new connection; a frame whose `length` is too large; a truncated fragment stream; an unauthenticated `ERROR` that must not end the session; a resent REQUEST that differs from the stored one.
+. *Store-and-forward.*
+Persistent device state, a resumption after a power cycle, a `session_unusable` rejection, and a duplicate RESPONSE after the session finished.
 . *Namespace.* Decide who owns the `macawg_` identifiers, and register or rename them.
 
 [appendix]
@@ -2221,6 +2673,11 @@ A helper being available does not mean that a given wallet or device calls it.
 |Binding B (OpenID4VCI issuance) |Not implemented |—
 |Binding C (OpenID4VP) |Not implemented |—
 |Binding D (CSC `signHash`, CSC Data Model Bindings) |Not implemented |—
+|BLE transport: GATT service, framing, HPKE, `k`, `session_key` |Not implemented |`TransportHint::Ble` parses `svc` and `name` only
+|Relative time checks over BLE |Not implemented |The absolute checks always apply
+|Offline issuer keys |Helper |`DidJwkResolver` for `did:jwk`; provisioned keys through `IssuerKeyResolver`
+|Untrusted-clock ICA validity rule |Not implemented |`verify_ica_credential` always compares `validFrom` and `validUntil` with the clock
+|Store-and-forward |Not implemented |—
 |Proof AAD `macawg.sign_response.oid4vp.v1` |Not implemented |—; `tests/vectors.rs` checks that a proof made with it does not verify under binding A
 |Binding A test vectors (<<impl-tasks>> item 1) |Library |`tests/vectors.rs`
 |===
@@ -2259,6 +2716,14 @@ Redirect handling belongs to the application's HTTP client.
 [appendix]
 [[changelog]]
 == Change log (informative)
+
+0.7-draft::
+* Replaced the BLE placeholder with a proposed BLE transport for binding A: a GATT service, framing and fragmentation, and HPKE (X25519, HKDF-SHA256, ChaCha20-Poly1305) keyed from a new invite parameter `k` (<<transport-ble>>).
+* Added `session_key`, which binds the HPKE key into the signed request, as `session_url` does for HTTPS.
+* Added relative time checks for BLE, so an offline device's clock need not be set (<<ble-time>>). HTTPS keeps the absolute checks.
+* Added rules for offline devices: issuer keys without the network, and ICA validity with an untrusted clock (<<offline>>).
+* Added proposed store-and-forward sessions (<<store-and-forward>>).
+* Updated the bindings table, compatibility matrix, extension inventory, recommendation, implementation tasks and implementation status.
 
 0.6-draft::
 * Retargeted to <<CAWG-IA>> 1.3. Section numbers cited from it are unchanged from 1.2.
