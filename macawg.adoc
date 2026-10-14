@@ -7,7 +7,7 @@
 :sectanchors:
 :icons: font
 :source-highlighter: rouge
-:revnumber: 0.3-draft
+:revnumber: 0.4-draft
 :revdate: 2026-10-14
 :cawg-ia: https://cawg.io/identity/1.2/
 :c2pa-spec: https://c2pa.org/specifications/specifications/2.2/specs/C2PA_Specification.html
@@ -292,11 +292,11 @@ A sign request is a JSON object <<RFC8259>> with these members:
 
 |`type` |REQUIRED |The string `macawg.sign_request`.
 |`version` |REQUIRED |The protocol version, `1`.
-|`session_id` |REQUIRED |MUST equal the invite's `sid`.
+|`session_id` |REQUIRED |MUST equal the invite's `sid`. 16 to 64 characters from the base64url alphabet (<<field-lengths>>).
 |`session_url` |REQUIRED for HTTPS |The session URL. MUST equal the invite's `u` (<<transport-https>>).
-|`nonce` |REQUIRED |MUST equal the invite's `n`.
+|`nonce` |REQUIRED |MUST equal the invite's `n`. 16 to 64 characters from the base64url alphabet (<<field-lengths>>).
 |`issued_at` |REQUIRED |Timestamp when the device created the request.
-|`expires_at` |REQUIRED |Timestamp after which the request MUST NOT be signed.
+|`expires_at` |REQUIRED |The nominal expiry. The request may be acted on until the acceptance deadline (<<acceptance-deadline>>), and not after.
 |`signer_payload` |REQUIRED |The signer payload to sign (<<wire-signer-payload>>).
 |`max_signature_size` |REQUIRED |The number of bytes the device reserved for the identity assertion's `signature` field. A positive integer.
 |`requested` |OPTIONAL |The identities the device asks for (<<requested>>). Absent means the wallet chooses.
@@ -528,6 +528,15 @@ That needs `expected_partial_claim` (<<binding-scope>>).
 This rule needs the `expected_*` members to be carried in <<wire-signer-payload>>, and needs claim generators to compute them.
 Neither is implemented in the reference implementation or in c2pa-rs 0.91.
 
+[IMPORTANT]
+.Release blocker
+====
+Because `expected_claim_generator` is REQUIRED, no implementation can yet complete an exchange that conforms to this draft.
+That includes the reference implementation, macawg 0.2.0.
+Implementing this field and its wallet check is the main blocker for a version 1 release.
+Until then, the reference implementation shows that the other rules work, but it does not conform.
+====
+
 [[request-auth]]
 == Request authentication
 
@@ -606,7 +615,7 @@ It MUST reject the request if any check fails.
 . `version` is supported.
 . `session_id` equals the invite's `sid`.
 . `nonce` equals the invite's `n`.
-. The current time is no later than `expires_at` plus the allowed clock skew.
+. The current time is no later than the acceptance deadline (<<acceptance-deadline>>).
 . `issued_at` is no later than the current time plus the allowed clock skew.
 . `signer_payload.sig_type` is `cawg.identity_claims_aggregation` or `cawg.x509.cose`.
 . `signer_payload.referenced_assertions` includes a hard binding assertion.
@@ -623,11 +632,25 @@ It MUST reject the request if any check fails.
 
 _(Checks 1–14, 16, 17 and 19–21 trace to `open_request` and `check_request`. The size check before decoding traces to `RequestEnvelope::from_slice`. For check 18, the reference implementation provides `SignResponse::check_before_send`, which refuses a `signed` response without a proof; the decision not to offer signing is the application's.)_
 
+[[acceptance-deadline]]
+=== Acceptance deadline
+
 The allowed clock skew is 5 minutes.
 _(Traces to `CLOCK_SKEW`.)_
-Because of the skew, a wallet can accept a request up to 5 minutes after `expires_at`, so the effective acceptance window is the nominal lifetime plus 5 minutes.
 
-The wallet MUST check expiry again immediately before it sends a `signed` response, and MUST NOT send one for an expired request.
+The _acceptance deadline_ of a request is `expires_at` plus the clock skew.
+It is the single deadline for every party, and every time check in this document uses it:
+
+* the wallet does not offer to sign after it (check 8 above);
+* the wallet does not send a `signed` response after it;
+* the device does not accept a response after it (<<device-validation>>);
+* the device discards the session after it (<<session-state>>).
+
+A request is _expired_ when the current time is later than its acceptance deadline.
+Because `expires_at` is at most 15 minutes after `issued_at`, the acceptance deadline is at most 20 minutes after `issued_at`.
+_(Traces to `SignRequest::check_not_expired`, used by `check_request`, `SignResponse::check_before_send` and `check_response`.)_
+
+The wallet MUST check the acceptance deadline again immediately before it sends a `signed` response, and MUST NOT send one after it.
 The person may take a long time to decide.
 _(Traces to `SignResponse::check_before_send`.)_
 
@@ -686,17 +709,28 @@ _(Rules 1, 2, 4, 5 and 6 trace to `UnsignedIcaCredential::issue`. Rule 3 is the 
 The issuer, not the wallet, produces the bytes that the device receives and that the asset publishes.
 An issuer could return extra identities or different values.
 It could also keep `verifiedIdentities` unchanged and add identifying information elsewhere, such as a stable `credentialSubject.id` or a custom property.
-The device's checks (<<device-ica>>) reject extra or changed identities, but only after the device has received them.
-The required device checks do not reject every other addition.
+The device's checks (<<device-ica>>) reject identities whose type, fields or provider the device did not request, but only after the device has received them.
+The device does not know the exact values the person approved, so it cannot detect a changed value.
+Only the wallet's exact-match check (check 2 below) protects the approved values.
+
+The published bytes are the whole tagged `COSE_Sign1`, not only the credential JSON.
+COSE headers sit outside the payload and can carry any data (<<RFC9052>> §3).
+An issuer could return approved credential JSON together with an identifying header parameter.
+It could also add an entry to `@context` or `type` whose URL contains an identifier, because <<CAWG-IA>> §8.1 requires only that those arrays contain at least the expected entries.
 
 Before it sends a `signed` response, the wallet MUST:
 
 . verify the returned credential with the checks of <<device-ica>>;
 . check that `verifiedIdentities` is exactly the list the person approved, with the same values;
-. check that the credential contains no property outside <<ica-properties>>, at any level.
+. check that the credential contains no property outside <<ica-properties>>, at any level;
+. *(proposed)* check that the `COSE_Sign1` headers and the structural values meet <<ica-cose-profile>>.
 
 If check 1 or 2 fails, the wallet MUST NOT send the credential.
-If check 3 fails, the wallet MUST either refuse to send the credential, or show the person every additional property and its value and send it only if the person approves.
+If check 3 or 4 fails, the wallet MUST either refuse to send the credential, or show the person every additional property, header or entry and its value and send it only if the person approves.
+
+The wallet MUST NOT remove or rewrite anything to make a credential pass.
+Removing a header or an entry would change the signed bytes, which would break the issuer's signature and the `signature_digest` of any response proof.
+The wallet either sends the bytes exactly as issued, or does not send them.
 
 _(Traces to `UnsignedIcaCredential::check_issued`. It compares `verifiedIdentities` with the unsigned credential's list, in order. Check 3 is part of check 1, because `verify_ica_credential` rejects any property outside <<ica-properties>>, so the reference implementation always takes the first option for check 3: it refuses.)_
 
@@ -715,7 +749,51 @@ _(Traces to `UnsignedIcaCredential::check_issued`. It compares `verifiedIdentiti
 
 <<CAWG-IA>> and the VC data model allow more properties than these.
 Macawg narrows the set because every property is published in the asset.
-A later version may add properties, such as `credentialStatus`, that carry no information about the person.
+
+[[ica-cose-profile]]
+==== COSE headers and structural values *(proposed)*
+
+The allowlist above covers the credential's properties.
+These rules cover the rest of the published bytes, and the values of the properties whose content is fixed:
+
+[cols="2,3",options="header"]
+|===
+|Item |Permitted content
+|Protected header |Exactly two parameters: `alg` (1) with value EdDSA (-8), and `content type` (3) with value `application/vc`.
+|Unprotected header |Empty.
+|`@context` |Exactly `["https://www.w3.org/ns/credentials/v2", "https://cawg.io/identity/1.1/ica/context/"]`, in that order.
+|`type` |Exactly `["VerifiableCredential", "IdentityClaimsAggregationCredential"]`, in that order.
+|`issuer` |A string: the issuer's DID, with no fragment and no query. Not an object.
+|`credentialSubject` |A single object, not an array.
+|===
+
+The device SHOULD apply the same rules.
+
+NOTE: The empty unprotected header is a deliberate initial limitation.
+It excludes the `sigTst2` time stamp header, which <<CAWG-IA>> §8.1.4 allows.
+A time-stamp token carries the time stamp authority's certificates, policy and optional extensions, which need their own privacy assessment before Macawg permits them.
+
+[[credential-status]]
+==== Revocation status: a deliberate initial limitation
+
+<<CAWG-IA>> §8.1.2.7 says an identity claims aggregator SHOULD make a credential revocable with a `credentialStatus` entry, preferably a W3C Bitstring Status List entry, and §8.1.5 tells validators how to check it.
+This Macawg profile excludes `credentialStatus`.
+As a result, it rejects ICA credentials that use credential-level revocation.
+This is a deliberate limitation of the first version, not a statement that revocation is unimportant.
+
+Status metadata is not automatically free of information about the person.
+A status entry carries a list URL and an index into the list.
+A per-person list URL identifies the person.
+A sequentially allocated index can reveal issue order and link credentials.
+When a validator fetches the status list, the issuer can learn which credentials are being checked, unless the list is large and served as a whole.
+
+A later version may permit a defined status structure, for example:
+
+* exactly one `BitstringStatusListEntry` with `statusPurpose` `revocation`;
+* a `statusListCredential` URL that the issuer shares across all its credentials, and that carries no per-person component;
+* a `statusListIndex` chosen at random from a list of at least 131,072 entries, the minimum size in the W3C Bitstring Status List specification.
+
+The wallet would then check the entry against this structure before release, in the same way as <<ica-cose-profile>>.
 
 [[ica-vc]]
 ==== Credential JSON
@@ -806,7 +884,7 @@ The wallet answers with a sign response, a JSON object with these members:
 |`status` |REQUIRED |`signed` or `declined`.
 |`signer_payload` |REQUIRED when `signed` |The payload that was signed. MUST equal the request's `signer_payload`.
 |`signature` |REQUIRED when `signed` |base64url of the exact bytes for the identity assertion's `signature` field.
-|`reason` |OPTIONAL when `declined` |Text explaining the refusal.
+|`reason` |OPTIONAL when `declined` |Text explaining the refusal. At most 256 bytes (<<field-lengths>>).
 |`response_proof` |OPTIONAL when `signed` |base64url of a tagged `COSE_Sign1` (<<response-proof>>).
 |===
 
@@ -905,7 +983,7 @@ It MUST reject the response if any check fails.
 . `type` is `macawg.sign_response`.
 . `version` is supported.
 . `session_id` and `nonce` equal those of the request the device sent.
-. The request has not expired: the current time is no later than `expires_at` plus the clock skew.
+. The current time is no later than the request's acceptance deadline (<<acceptance-deadline>>).
 . If `status` is `declined`, the session ends without a signature.
 . `signer_payload` equals the request's `signer_payload`.
 . The decoded `signature` is no longer than `max_signature_size`.
@@ -920,10 +998,10 @@ _(Traces to `check_response`.)_
 For `cawg.identity_claims_aggregation`, the device MUST check:
 
 . `signature` is a tagged `COSE_Sign1`, as <<CAWG-IA>> §8.1 requires.
-. Its protected header has `alg` EdDSA and `content type` `application/vc`.
+. Its protected header has `alg` EdDSA and `content type` `application/vc`. *(proposed)* It has no other header parameters, protected or unprotected (<<ica-cose-profile>>).
 . The payload is embedded, and parses as credential JSON.
-. `@context` contains both `https://www.w3.org/ns/credentials/v2` and `https://cawg.io/identity/1.1/ica/context/`.
-. `type` contains both `VerifiableCredential` and `IdentityClaimsAggregationCredential`.
+. `@context` contains both `https://www.w3.org/ns/credentials/v2` and `https://cawg.io/identity/1.1/ica/context/`. *(proposed)* It contains nothing else (<<ica-cose-profile>>).
+. `type` contains both `VerifiableCredential` and `IdentityClaimsAggregationCredential`. *(proposed)* It contains nothing else.
 . The `issuer`, with any fragment removed, is in `requested.accepted_issuers`, if that list is present and non-empty.
 . The issuer's Ed25519 key is resolved from an `assertionMethod` verification method: locally for `did:jwk`, and with a DID resolver for other methods. If the device cannot resolve the key, the check fails.
 . The Ed25519 signature verifies with an empty external AAD.
@@ -959,10 +1037,10 @@ The reference implementation is stateless, so the application that runs the sess
 It MUST mark the session as finished atomically with accepting the response, so that two concurrent submissions cannot both be accepted.
 * A response that fails validation MUST NOT end the session.
 Otherwise anyone who can reach the session URL could close the session by posting garbage.
-The wallet MAY retry until the request expires.
+The wallet MAY retry until the acceptance deadline.
 The device SHOULD rate-limit submissions per session.
 * A valid `declined` response ends the session.
-* The device MUST discard the session once it is finished or the request has expired.
+* The device MUST discard the session once it is finished, or once the acceptance deadline has passed (<<acceptance-deadline>>).
 
 [[transport]]
 == Transport bindings
@@ -1147,15 +1225,44 @@ A receiver MUST reject an input that exceeds them, and MUST check sizes as recei
 |Sign response, as received |128 KiB
 |===
 
-Any allowed request leads to a response that fits within the response maximum.
-The response carries:
+[[field-lengths]]
+==== Field lengths *(proposed)*
 
-* the echoed `signer_payload`, at most 32 KiB;
+[cols="2,3",options="header"]
+|===
+|Field |Allowed length and content
+|`session_id`, `sid` |16 to 64 characters from the base64url alphabet (`A`–`Z`, `a`–`z`, `0`–`9`, `-`, `_`)
+|`nonce`, `n` |16 to 64 characters from the base64url alphabet; at least 128 bits of entropy (<<invite>>)
+|`reason` |At most 256 bytes of UTF-8
+|`version` |The integer `1`
+|===
+
+A receiver MUST reject a message in which any of these fields breaks its limit.
+Restricting `session_id` and `nonce` to the base64url alphabet also means they never need JSON escapes or percent-encoding.
+
+==== How sizes are measured
+
+* The size of a message "as received" is the number of octets in the HTTP body, or in the reassembled message for another transport.
+* The length of a string field is the number of octets in its UTF-8 encoding after JSON unescaping.
+* The size of `signer_payload` is the number of octets in its _compact form_: UTF-8 JSON with no insignificant whitespace, in which only `"`, `\` and the characters U+0000 to U+001F are escaped, each with its two-character escape where one exists and as `\u00XX` otherwise.
+
+Senders MUST write all messages in compact form.
+Then the `signer_payload` that the wallet echoes has the same size as the one the device sent, whatever order the wallet writes its members in.
+
+==== Response size guarantee
+
+Any allowed request leads to a `signed` response that fits within the response maximum.
+In compact form, the response carries:
+
+* the echoed `signer_payload`, at most 32,768 bytes;
 * the base64url `signature`, at most 87,382 characters for 64 KiB;
 * the base64url `response_proof`, at most 1,366 characters for 1 KiB;
-* other members and JSON syntax, under 2 KiB.
+* the other members and JSON syntax, at most 269 bytes, given the field lengths above. This is the size of `{"type":"macawg.sign_response","version":1,"session_id":"…","nonce":"…","status":"signed","signer_payload":…,"signature":"…","response_proof":"…"}` with 64-character `session_id` and `nonce`, and without the three variable values.
 
-That totals at most 123,564 bytes, which is under 128 KiB (131,072 bytes).
+That totals at most 121,785 bytes, which is under 128 KiB (131,072 bytes).
+A `declined` response is far smaller: its largest variable part, `reason`, is at most 1,536 bytes in compact form, because each of its 256 bytes takes at most six characters.
+
+Receivers MUST still enforce the response maximum on the actual bytes received.
 
 _(Traces to `MAX_ENVELOPE_SIZE`, `MAX_SIGNER_PAYLOAD_SIZE`, `MAX_THUMBNAIL_SIZE`, `MAX_X5CHAIN_CERTS`, `MAX_RESPONSE_PROOF_SIZE` and `MAX_RESPONSE_SIZE`. `seal_request` refuses to exceed them. `RequestEnvelope::from_slice` and `SignResponse::from_slice` check the received size before decoding, and `open_request` and `check_response` check the parts.)_
 
@@ -1249,38 +1356,60 @@ This is left to a future companion document, because the draft issuer API is not
 [appendix]
 == Implementation status (informative)
 
-[cols="3,1,3",options="header"]
+This table describes the reference implementation, `macawg` 0.2.0.
+It separates three things:
+
+Library::
+The crate enforces the rule whenever the named function is used.
+Helper::
+The crate provides a function, but the rule holds only if the wallet or device application calls it.
+Application::
+The crate does not help; the application must implement the rule.
+Not implemented::
+No support yet.
+
+A helper being available does not mean that a given wallet or device calls it.
+
+[cols="4,2,4",options="header"]
 |===
-|Rule |Status |Reference implementation
-|Invite syntax and parsing |Implemented |`Invite::to_uri`, `Invite::parse`
-|Request structure and `requested` |Implemented |`SignRequest`, `Requested::validate`
-|Request sealing (COSE, x5chain, AAD) |Implemented |`seal_request`
-|Wallet validation, checks 1–13 |Implemented |`open_request`, `check_request`
-|Wallet check of tagged COSE and content type |Implemented |`open_request`
-|`session_url` binding and exact URL comparison |Implemented |`check_request`, `check_session_url`; `u` kept as decoded
-|Reject unknown `signer_payload` members |Implemented |`WireSignerPayload`, `WireHashedUri` deny unknown fields
-|Request lifetime limits |Implemented |`seal_request`, `check_request`
-|Expiry re-check before sending and on receipt |Implemented |`SignResponse::check_before_send`, `check_response`
-|Resource limits |Implemented |`MAX_*` constants, `RequestEnvelope::from_slice`, `SignResponse::from_slice`
-|Wallet check of issued credential before release |Implemented |`UnsignedIcaCredential::check_issued`
-|`response_proof`, `response_proof_required` and proof validation |Implemented |`ica_response_proof`, `x509_response_proof`, `check_response`
-|Issuer creates a proof only in an authorized transaction |Out of scope |The issuer service's job
-|`crit` |Implemented |`check_crit`, `REQUEST_MEMBERS`
-|Permitted ICA credential properties |Implemented |`verify_ica_credential` denies unknown properties
-|Tagged-only ICA `COSE_Sign1` |Implemented |`verify_ica_credential`
-|Required `validFrom` |Implemented |`verify_ica_credential`
-|No redirects; post only to `session_url` |Proposed |Left to the application's HTTP client
-|Production issuer trust policy |Proposed |Empty `accepted_issuers` accepts any issuer
-|`expected_*` members in `signer_payload` |Proposed |Not carried, so rejected as unknown; c2pa-rs 0.91 does not model them
-|`expected_claim_generator` binding |Proposed |—
-|Minimum nonce entropy |Proposed |`random_token(16)` available, not enforced
-|Rejecting `http` session URLs |Proposed |`http` accepted
-|Rejecting `did:jwk` with `"use": "enc"` |Proposed |Not checked
-|Unsigned ICA credential and issuance |Implemented |`UnsignedIcaCredential`
-|Device validation of responses |Implemented |`check_response`, `verify_ica_credential`
-|Session state and retries |Proposed |Left to the application
-|HTTPS binding |Implemented (hint only) |`TransportHint::Https`; the HTTP server is the application's
-|BLE binding |Placeholder |`TransportHint::Ble`
+|Rule |Support |Where
+
+|Invite syntax, parsing, and keeping the decoded `u` |Library |`Invite::to_uri`, `Invite::parse`
+|Request structure and `requested` |Library |`SignRequest`, `Requested::validate`
+|Request sealing (COSE, `x5chain`, AAD) |Library |`seal_request`
+|Wallet checks 1–14, 16, 17 and 19–21 (<<wallet-validation>>) |Library |`open_request`, `check_request`
+|Tagged request COSE and content type |Library |`open_request`
+|`session_url` comparison |Library |`check_request`, `check_session_url`
+|Reject unknown `signer_payload` members |Library |`WireSignerPayload`, `WireHashedUri` deny unknown fields
+|`crit` |Library |`check_crit`, `REQUEST_MEMBERS`
+|Request lifetime and acceptance deadline on fetch |Library |`check_request`
+|Acceptance deadline before sending |Helper |`SignResponse::check_before_send`
+|Acceptance deadline on receipt |Library |`check_response`
+|Resource maximums |Library |`MAX_*` constants, `RequestEnvelope::from_slice`, `SignResponse::from_slice`
+|Field lengths for `session_id`, `nonce`, `reason` |Not implemented |—
+|Compact-form serialization |Not implemented |serde_json writes compact JSON but does not enforce the escape rules
+|Wallet check of an issued credential before release |Helper |`UnsignedIcaCredential::check_issued`
+|Permitted ICA credential properties |Library |`verify_ica_credential` denies unknown properties
+|COSE header and structural-value profile (<<ica-cose-profile>>) |Not implemented |Extra headers and extra `@context` or `type` entries are accepted
+|Tagged-only ICA `COSE_Sign1`, required `validFrom` |Library |`verify_ica_credential`
+|`response_proof` creation |Helper |`ica_response_proof`, `x509_response_proof`
+|`response_proof` validation, and enforcing `response_proof_required` |Library |`check_response`
+|Not offering to sign when a required proof is unavailable |Application |`check_before_send` refuses to send a `signed` response without one
+|Issuer creates a proof only in an authorized transaction |Application |The issuer service
+|`expected_*` members in `signer_payload` |Not implemented |Rejected as unknown; c2pa-rs 0.91 does not model them. *Release blocker*
+|`expected_claim_generator` binding |Not implemented |*Release blocker*
+|Unsigned ICA credential and issuance |Library |`UnsignedIcaCredential`
+|Device validation of responses |Library |`check_response`, `verify_ica_credential`
+|No redirects; post only to `session_url` |Application |The wallet's HTTP client
+|Session state, retries and discarding after the deadline |Application |The device's session store
+|Production issuer trust policy |Application |Empty `accepted_issuers` accepts any issuer
+|Production requester trust (`TrustMode::TrustAnchors`) |Application |The wallet chooses the trust mode
+|User interface rules (showing values, consent) |Application |—
+|Minimum nonce entropy |Helper |`random_token(16)`; the field-length rule is not enforced
+|Rejecting `http` session URLs |Not implemented |`http` accepted
+|Rejecting `did:jwk` with `"use": "enc"` |Not implemented |Not checked
+|HTTPS binding |Application |`TransportHint::Https` is the hint only; the HTTP server and client are the application's
+|BLE binding |Not implemented |`TransportHint::Ble` placeholder
 |Wallet to issuer API |Out of scope |Draft in `macawg-wallet`
 |===
 
@@ -1301,4 +1430,8 @@ Redirect handling belongs to the application's HTTP client.
 * a session URL that answers the response `POST` with a redirect;
 * a `session_url` that differs from `u` only by normalization (case, default port, or percent-encoding);
 * a request whose `crit` names a member the receiver does not implement;
-* a request, a `signer_payload`, or a response that exceeds a maximum in <<resource-limits>>.
+* a request, a `signer_payload`, or a response that exceeds a maximum in <<resource-limits>>;
+* an issued credential with an extra protected or unprotected COSE header parameter;
+* an issued credential with an extra `@context` or `type` entry;
+* a `session_id`, `nonce` or `reason` that breaks <<field-lengths>>;
+* a complete conforming exchange that uses `expected_claim_generator`, once it can be implemented.
