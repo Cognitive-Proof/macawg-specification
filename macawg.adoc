@@ -723,7 +723,7 @@ Before it sends a `signed` response, the wallet MUST:
 . verify the returned credential with the checks of <<device-ica>>;
 . check that `verifiedIdentities` is exactly the list the person approved, with the same values;
 . check that the credential contains no property outside <<ica-properties>>, at any level;
-. *(proposed)* check that the `COSE_Sign1` headers and the structural values meet <<ica-cose-profile>>.
+. check that the `COSE_Sign1` headers and the structural values meet <<ica-cose-profile>>.
 
 If check 1 or 2 fails, the wallet MUST NOT send the credential.
 If check 3 or 4 fails, the wallet MUST either refuse to send the credential, or show the person every additional property, header or entry and its value and send it only if the person approves.
@@ -732,7 +732,7 @@ The wallet MUST NOT remove or rewrite anything to make a credential pass.
 Removing a header or an entry would change the signed bytes, which would break the issuer's signature and the `signature_digest` of any response proof.
 The wallet either sends the bytes exactly as issued, or does not send them.
 
-_(Traces to `UnsignedIcaCredential::check_issued`. It compares `verifiedIdentities` with the unsigned credential's list, in order. Check 3 is part of check 1, because `verify_ica_credential` rejects any property outside <<ica-properties>>, so the reference implementation always takes the first option for check 3: it refuses.)_
+_(Traces to `UnsignedIcaCredential::check_issued`. It compares `verifiedIdentities` with the unsigned credential's list, in order. Checks 3 and 4 are part of check 1, because `verify_ica_credential` rejects any property outside <<ica-properties>> and applies <<ica-cose-profile>>, so the reference implementation always takes the first option for checks 3 and 4: it refuses.)_
 
 [[ica-properties]]
 .Permitted ICA credential properties (Macawg restriction)
@@ -751,7 +751,7 @@ _(Traces to `UnsignedIcaCredential::check_issued`. It compares `verifiedIdentiti
 Macawg narrows the set because every property is published in the asset.
 
 [[ica-cose-profile]]
-==== COSE headers and structural values *(proposed)*
+==== COSE headers and structural values
 
 The allowlist above covers the credential's properties.
 These rules cover the rest of the published bytes, and the values of the properties whose content is fixed:
@@ -768,6 +768,7 @@ These rules cover the rest of the published bytes, and the values of the propert
 |===
 
 The device SHOULD apply the same rules.
+_(Traces to `verify_ica_credential`, so the reference implementation applies them on the device and in `UnsignedIcaCredential::check_issued`.)_
 
 NOTE: The empty unprotected header is a deliberate initial limitation.
 It excludes the `sigTst2` time stamp header, which <<CAWG-IA>> §8.1.4 allows.
@@ -998,10 +999,10 @@ _(Traces to `check_response`.)_
 For `cawg.identity_claims_aggregation`, the device MUST check:
 
 . `signature` is a tagged `COSE_Sign1`, as <<CAWG-IA>> §8.1 requires.
-. Its protected header has `alg` EdDSA and `content type` `application/vc`. *(proposed)* It has no other header parameters, protected or unprotected (<<ica-cose-profile>>).
+. Its protected header has `alg` EdDSA and `content type` `application/vc`. It has no other header parameters, protected or unprotected (<<ica-cose-profile>>).
 . The payload is embedded, and parses as credential JSON.
-. `@context` contains both `https://www.w3.org/ns/credentials/v2` and `https://cawg.io/identity/1.1/ica/context/`. *(proposed)* It contains nothing else (<<ica-cose-profile>>).
-. `type` contains both `VerifiableCredential` and `IdentityClaimsAggregationCredential`. *(proposed)* It contains nothing else.
+. `@context` contains both `https://www.w3.org/ns/credentials/v2` and `https://cawg.io/identity/1.1/ica/context/`. It contains nothing else (<<ica-cose-profile>>).
+. `type` contains both `VerifiableCredential` and `IdentityClaimsAggregationCredential`. It contains nothing else.
 . The `issuer`, with any fragment removed, is in `requested.accepted_issuers`, if that list is present and non-empty.
 . The issuer's Ed25519 key is resolved from an `assertionMethod` verification method: locally for `did:jwk`, and with a DID resolver for other methods. If the device cannot resolve the key, the check fails.
 . The Ed25519 signature verifies with an empty external AAD.
@@ -1010,7 +1011,7 @@ For `cawg.identity_claims_aggregation`, the device MUST check:
 . `credentialSubject.c2paAsset`, with its hashes decoded from standard base64, equals the request's `signer_payload`.
 . `verifiedIdentities` is non-empty, and, if the request has `requested`, answers it (<<selective-disclosure>>).
 
-_(Traces to `verify_ica_credential`.)_
+_(Traces to `verify_ica_credential`. Because it applies <<ica-cose-profile>>, it also requires the `@context` and `type` entries in order, rejects an `issuer` with a fragment or query, and accepts `credentialSubject` only as a single object.)_
 
 These checks repeat the issuer's checks.
 The device does not trust the wallet to have chosen the identities correctly, nor the issuer to have honoured `accepted_issuers`.
@@ -1226,7 +1227,7 @@ A receiver MUST reject an input that exceeds them, and MUST check sizes as recei
 |===
 
 [[field-lengths]]
-==== Field lengths *(proposed)*
+==== Field lengths
 
 [cols="2,3",options="header"]
 |===
@@ -1239,6 +1240,7 @@ A receiver MUST reject an input that exceeds them, and MUST check sizes as recei
 
 A receiver MUST reject a message in which any of these fields breaks its limit.
 Restricting `session_id` and `nonce` to the base64url alphabet also means they never need JSON escapes or percent-encoding.
+_(Traces to `check_token` and `TOKEN_LENGTH`, called from `Invite::parse`, `seal_request`, `check_request` and `check_response`, and to `MAX_REASON_SIZE`, checked by `SignResponse::check_before_send` and `check_response`. `Invite::parse` requires `v` to be exactly the string `1`.)_
 
 ==== How sizes are measured
 
@@ -1248,6 +1250,7 @@ Restricting `session_id` and `nonce` to the base64url alphabet also means they n
 
 Senders MUST write all messages in compact form.
 Then the `signer_payload` that the wallet echoes has the same size as the one the device sent, whatever order the wallet writes its members in.
+_(serde_json's default output, `serde_json::to_vec`, is the compact form; a unit test checks the escapes. `seal_request` writes the request with it and measures `signer_payload` on it. An application that serializes a `SignResponse` itself must use the same function, not a pretty printer.)_
 
 ==== Response size guarantee
 
@@ -1357,7 +1360,7 @@ This is left to a future companion document, because the draft issuer API is not
 == Implementation status (informative)
 
 This table describes the reference implementation, `macawg` 0.2.0.
-It separates three things:
+It separates four things:
 
 Library::
 The crate enforces the rule whenever the named function is used.
@@ -1386,11 +1389,12 @@ A helper being available does not mean that a given wallet or device calls it.
 |Acceptance deadline before sending |Helper |`SignResponse::check_before_send`
 |Acceptance deadline on receipt |Library |`check_response`
 |Resource maximums |Library |`MAX_*` constants, `RequestEnvelope::from_slice`, `SignResponse::from_slice`
-|Field lengths for `session_id`, `nonce`, `reason` |Not implemented |—
-|Compact-form serialization |Not implemented |serde_json writes compact JSON but does not enforce the escape rules
+|Field lengths for `session_id`, `nonce`, `reason`, and exact `version` |Library |`check_token`, `TOKEN_LENGTH`, `MAX_REASON_SIZE`
+|Compact-form serialization of requests and `signer_payload` size |Library |`seal_request` (serde_json's default output is compact form)
+|Compact-form serialization of responses |Helper |`SignResponse` with `serde_json::to_vec`
 |Wallet check of an issued credential before release |Helper |`UnsignedIcaCredential::check_issued`
 |Permitted ICA credential properties |Library |`verify_ica_credential` denies unknown properties
-|COSE header and structural-value profile (<<ica-cose-profile>>) |Not implemented |Extra headers and extra `@context` or `type` entries are accepted
+|COSE header and structural-value profile (<<ica-cose-profile>>) |Library |`verify_ica_credential`, also used by `check_issued`
 |Tagged-only ICA `COSE_Sign1`, required `validFrom` |Library |`verify_ica_credential`
 |`response_proof` creation |Helper |`ica_response_proof`, `x509_response_proof`
 |`response_proof` validation, and enforcing `response_proof_required` |Library |`check_response`
@@ -1405,7 +1409,7 @@ A helper being available does not mean that a given wallet or device calls it.
 |Production issuer trust policy |Application |Empty `accepted_issuers` accepts any issuer
 |Production requester trust (`TrustMode::TrustAnchors`) |Application |The wallet chooses the trust mode
 |User interface rules (showing values, consent) |Application |—
-|Minimum nonce entropy |Helper |`random_token(16)`; the field-length rule is not enforced
+|Minimum nonce entropy |Helper |`random_token(16)`; the length and alphabet are enforced, the entropy cannot be
 |Rejecting `http` session URLs |Not implemented |`http` accepted
 |Rejecting `did:jwk` with `"use": "enc"` |Not implemented |Not checked
 |HTTPS binding |Application |`TransportHint::Https` is the hint only; the HTTP server and client are the application's
@@ -1421,7 +1425,7 @@ Each will give the request bytes, the protected header bytes, the external AAD, 
 Until then, `tests/exchange.rs` and `tests/end_to_end.rs` in the https://github.com/Cognitive-Proof/macawg[reference implementation] are the closest equivalent.
 
 The vectors will include an end-to-end exchange with the proposed checks implemented, and at least these rejection cases.
-All but the redirect case are already tests in the reference implementation: `tests/exchange.rs`, and the unit tests in `src/seal.rs`, `src/ica.rs` and `src/invite.rs`.
+All but the redirect and `expected_claim_generator` cases are already tests in the reference implementation: `tests/exchange.rs`, and the unit tests in `src/seal.rs`, `src/ica.rs`, `src/invite.rs` and `src/request.rs`.
 Redirect handling belongs to the application's HTTP client.
 
 * a `response_proof` whose `request_digest` or `signature_digest` does not match;
