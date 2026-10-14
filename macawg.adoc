@@ -2222,7 +2222,7 @@ A helper being available does not mean that a given wallet or device calls it.
 |Binding C (OpenID4VP) |Not implemented |—
 |Binding D (CSC `signHash`, CSC Data Model Bindings) |Not implemented |—
 |Proof AAD `macawg.sign_response.oid4vp.v1` |Not implemented |—; `tests/vectors.rs` checks that a proof made with it does not verify under binding A
-|Binding A test vectors (<<impl-tasks>> item 2) |Library |`tests/vectors.rs`
+|Binding A test vectors (<<impl-tasks>> item 1) |Library |`tests/vectors.rs`
 |===
 
 [appendix]
