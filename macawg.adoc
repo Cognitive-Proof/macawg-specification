@@ -7,7 +7,7 @@
 :sectanchors:
 :icons: font
 :source-highlighter: rouge
-:revnumber: 0.14-draft
+:revnumber: 0.15-draft
 :revdate: 2026-10-14
 :cawg-ia: https://cawg.io/identity/1.3/
 :c2pa-spec: https://c2pa.org/specifications/specifications/2.2/specs/C2PA_Specification.html
@@ -322,6 +322,10 @@ There is one named exception, _limited validity mode_ (<<offline-validity>>).
 A device without trusted current time cannot establish that a credential is valid when it accepts it, so it does not meet G7's temporal-validity requirement.
 It conforms only in limited validity mode, and only if it records which lower acceptance level it reached.
 Every other guarantee still applies in full.
+
+Binding E (<<binding-e>>) has two further, named limitations.
+It does not provide G10; it provides a weaker _authenticated issuance session_ instead (<<e-g10>>).
+It provides G5 and G6 only under an _issuer-trusted consent_ model, in which the issuer, not the wallet, shows the request and enforces the person's selection (<<e-consent>>).
 The section references give the binding A rules.
 
 [cols="1,3,5,2",options="header"]
@@ -368,7 +372,7 @@ What a binding must define is its _request representation_, the exact octets tha
 
 |A, COSE/HTTPS |The octets of the decoded envelope `request` member: the UTF-8 JSON exactly as signed. |`macawg.sign_response.v1` |Implemented
 |C, OpenID4VP |The octets of the Request Object, in JWS compact serialization, exactly as received from `request_uri`, before any decoding. |`macawg.sign_response.oid4vp.v1` *(proposed)* |Not implemented
-|E, DIDComm Issue Credential |The request octets inside the proposal attachment, as in binding A. Binding E uses an offer commitment instead of a response proof (<<e-bytes>>). |None |Not implemented
+|E, DIDComm Issue Credential |Not applicable: binding E does not support response proofs or G10 (<<e-g10>>). |None |Not implemented
 |===
 
 Binding B is not device-facing.
@@ -396,7 +400,7 @@ These rules apply to every binding:
 |C, OpenID4VP (<<binding-c>>) |Device and wallet |Proposed, evaluation only |Not implemented
 |D, CSC `signHash` remote signing (<<binding-d>>) |Wallet and RSSP |Proposed, ES* and PS* only |Not implemented
 |D, CSC Data Model Bindings profile (<<binding-d-dmb>>) |Device and wallet, over OpenID4VP |Informative evaluation |Not implemented
-|E, DIDComm Issue Credential 3.0 (<<binding-e>>) |Device and ICA issuer, with a separate approval leg to the actor |Proposed |Not implemented
+|E, DIDComm Issue Credential 3.0 (<<binding-e>>) |Device and ICA issuer, with a separate approval leg to the actor |Proposed, experimental; no G10; issuer-trusted consent |Not implemented
 |===
 
 Bindings compose: a device and wallet use A (or C), and the wallet may use B with its ICA issuer, or D with an RSSP. Binding E replaces both legs: the device talks to the ICA issuer directly, and the issuer runs the approval with the actor.
@@ -436,6 +440,7 @@ macawg://sign?v=1&sid=<session id>&n=<nonce>&t=ble&svc=<service UUID>&k=<device 
 |`svc` |REQUIRED when `t=ble` |BLE GATT service UUID (<<transport-ble>>).
 |`name` |OPTIONAL, `t=ble` only |BLE local name, to help the wallet pick a peripheral.
 |`k` |REQUIRED when `t=ble` *(proposed)* |The device's ephemeral HPKE public key, base64url (<<ble-invite>>).
+|`dt` |REQUIRED when the request carries `delivery_token_hash` *(proposed)* |The delivery token (<<delivery-token>>).
 |===
 
 Parameter values MUST be percent-encoded as `application/x-www-form-urlencoded` query values.
@@ -496,6 +501,7 @@ A sign request is a JSON object <<RFC8259>> with these members:
 |`context` |OPTIONAL |Descriptive information for display (<<request-context>>).
 |`response_proof_required` |OPTIONAL |Boolean, default `false`. When `true`, the device will accept a `signed` response only with a valid `response_proof` (<<response-proof>>).
 |`crit` |OPTIONAL |Array of top-level member names that the receiver MUST understand (<<extensions>>).
+|`delivery_token_hash` |REQUIRED when `response_proof_required` is `true`; RECOMMENDED otherwise *(proposed)* |base64url SHA-256 of the invite's `dt` (<<delivery-token>>). MUST be listed in `crit`.
 |`store_and_forward` |OPTIONAL, BLE only *(proposed)* |An object with `lifetime`, in seconds, up to 604800. Asks for a resumable session (<<store-and-forward>>).
 |===
 
@@ -761,6 +767,25 @@ _(Traces to `check_request`.)_
 The reference implementation leaves HTTP to the application, so the application must enforce this rule.
 This stops an attacker from showing an invite that points to their own proxy, relaying the device's request through it, and collecting the response.
 
+[[delivery-token]]
+===== Delivery token *(proposed)*
+
+The signed request carries everything a party needs to deliver a response: `session_id`, `nonce`, and `session_url` or `session_key`.
+That is acceptable while only the wallet sees the request.
+But when a response proof is required, binding B forwards the whole signed request to the ICA issuer (<<vci-dataset>>), and binding C would forward the Request Object.
+An issuer that holds the request could then deliver a response itself, bypassing the wallet's release checks (<<wallet-release>>): for example, a credential with an optional identity the person deselected, or another value within an allowed field.
+The device's checks would pass, and the device could not tell that the wallet never released the bytes.
+
+The delivery token is a capability that only the wallet holds:
+
+* The device generates a fresh token `dt` with at least 128 bits of entropy for each session, puts it in the invite as `dt`, and puts only its SHA-256 in the signed request as `delivery_token_hash`, listed in `crit`.
+* The wallet sends `dt` as `delivery_token` in its sign response, and MUST NOT send `dt` to the issuer or anyone else.
+* The device MUST reject a response whose `delivery_token` does not hash to `delivery_token_hash`.
+
+The issuer sees only the hash, so it cannot produce a response the device accepts.
+A device MUST include `delivery_token_hash` whenever it sets `response_proof_required`, and SHOULD include it otherwise.
+The token is a bearer secret: anyone who sees the invite has it, as with the nonce; it protects against parties that see only the signed request.
+
 [[trust-modes]]
 ==== Requester trust
 
@@ -806,8 +831,9 @@ It MUST reject the request if any check fails.
 . *(proposed)* For BLE, `session_key` is present and equals the invite's `k`, and `session_url` is absent (<<ble-destination>>). For HTTPS, `session_key` is absent.
 . *(proposed)* For BLE, checks 8 and 9 are replaced by the relative-lifetime rules of <<ble-time>>.
 . *(proposed)* If `store_and_forward` is present, the transport is BLE, `lifetime` is from 1 to 604800, `store_and_forward` is listed in `crit`, and the wallet can store and resume the session (<<store-and-forward>>).
+. *(proposed)* If `delivery_token_hash` is present, the invite carries `dt`, and the SHA-256 of `dt` equals `delivery_token_hash` (<<delivery-token>>).
 
-_(Checks 1–14, 16, 17 and 19–21 trace to `open_request` and `check_request`. Checks 22 to 24 are not implemented; a request that lists `session_key` or `store_and_forward` in `crit` is rejected by the reference implementation as an unknown critical member. The size check before decoding traces to `RequestEnvelope::from_slice`. For check 18, the reference implementation provides `SignResponse::check_before_send`, which refuses a `signed` response without a proof; the decision not to offer signing is the application's.)_
+_(Checks 1–14, 16, 17 and 19–21 trace to `open_request` and `check_request`. Checks 22 to 25 are not implemented; a request that lists `session_key`, `store_and_forward` or `delivery_token_hash` in `crit` is rejected by the reference implementation as an unknown critical member. The size check before decoding traces to `RequestEnvelope::from_slice`. For check 18, the reference implementation provides `SignResponse::check_before_send`, which refuses a `signed` response without a proof; the decision not to offer signing is the application's.)_
 
 [[acceptance-deadline]]
 ==== Acceptance deadline
@@ -1083,6 +1109,7 @@ The wallet answers with a sign response, a JSON object with these members:
 |`signer_payload` |REQUIRED when `signed` |The payload that was signed. MUST equal the request's `signer_payload`.
 |`signature` |REQUIRED when `signed` |base64url of the exact bytes for the identity assertion's `signature` field.
 |`reason` |OPTIONAL when `declined` |Text explaining the refusal. At most 256 bytes (<<field-lengths>>).
+|`delivery_token` |REQUIRED when the request carries `delivery_token_hash` *(proposed)* |The invite's `dt`, unchanged (<<delivery-token>>).
 |`response_proof` |OPTIONAL when `signed` |base64url of a tagged `COSE_Sign1` (<<response-proof>>).
 |===
 
@@ -1197,6 +1224,7 @@ It MUST reject the response if any check fails.
 . `type` is `macawg.sign_response`.
 . `version` is supported.
 . `session_id` and `nonce` equal those of the request the device sent.
+. *(proposed)* If the request carries `delivery_token_hash`, the response carries `delivery_token`, and its SHA-256 equals `delivery_token_hash` (<<delivery-token>>).
 . The current time is no later than the request's acceptance deadline (<<acceptance-deadline>>), or, over BLE, the device's deadline in <<ble-time>>.
 . If `status` is `declined`, the session ends without a signature.
 . `signer_payload` equals the request's `signer_payload`.
@@ -1816,7 +1844,7 @@ The wallet:
 The device persists, so that a power cycle does not lose them:
 
 * `sid`, the nonce, and `skD`. The device SHOULD keep `skD` in protected storage, such as a secure element;
-* the request bytes it sent, which it needs for the response proof and for check 6 of <<device-validation>>;
+* the request bytes it sent, which it needs for the response proof and for the `signer_payload` check of <<device-validation>>;
 * `t_create`, and enough clock state to measure elapsed time across a power cycle. A device that cannot measure elapsed time reliably after a restart MUST treat its _open_ sessions as expired, but MUST still finalize any session that is _accepted, awaiting finalization_;
 * the asset and its unfinished claim, exactly as they were when it computed the `signer_payload`, including the space reserved for the identity assertion;
 * a _finished_ flag, written atomically with accepting a response, together with the recorded outcome and the SHA-256 of the complete sign response octets (<<session-state>>).
@@ -2085,7 +2113,8 @@ A wallet whose issuer rejects the dataset, or cannot return a required proof, an
 ==== Changes from earlier drafts
 
 Trust model:: Unchanged. The device trusts DIDs; the issuer endpoint is only located by URL.
-Privacy:: Unchanged in content: the issuer sees the signer payload hashes and the identities, as before. The dataset now also passes through the Authorization Server.
+Privacy:: When no proof is required, the issuer sees the signer payload hashes and the identities, as before. When a proof is required, it also receives the signed request: the requester's certificate, the `context` including any thumbnail, the session id, the nonce, and the session's endpoint. The dataset passes through the Authorization Server too.
+Delivery:: Because the issuer then holds everything needed to address the device, the request MUST carry `delivery_token_hash`, so that only the wallet can deliver the response (<<delivery-token>>).
 Cryptography:: Unchanged. The credential and the proof are the same objects.
 User experience:: The person authenticates at the issuer for each signing that requires a proof. This was already required by G10.
 Wire representation:: Binding A is unchanged. The wallet-to-issuer interface is new; the earlier one was informative only.
@@ -2223,6 +2252,7 @@ These rules replace the binding A checks:
 . The wallet MUST check that the origin of `response_uri`, from the signed Request Object, equals the origin of the `request_uri` it fetched. This replaces the exact `session_url` comparison (<<url-comparison>>), because <<OpenID4VP>> uses two different URLs.
 . The wallet MUST NOT follow HTTP redirects when it fetches `request_uri` or posts to `response_uri`.
 . The device MUST NOT return `redirect_uri` in its response to the wallet's POST. <<OpenID4VP>> §8.2 says the wallet must follow one when present; in a cross-device flow that would only open a browser on the phone.
+. *(proposed)* Binding C needs an equivalent of the delivery token (<<delivery-token>>) in the QR code, because binding B under C forwards the Request Object, which contains `response_uri`, `state` and `nonce`. Until one is defined, binding B MUST NOT be used with a response proof under binding C.
 . The wallet SHOULD use `request_uri_method` `post` with `wallet_nonce` (<<OpenID4VP>> §5.10), so the Request Object is fresh for this wallet.
 
 <<OpenID4VP>> §14.2 notes that `direct_post` is susceptible to session fixation, and that its response-code mitigation does not apply to cross-device flows.
@@ -2341,7 +2371,8 @@ This binding lets a claim generator (the _device_; here typically an authoring a
 The issuer, not the device, coordinates the named actor's approval.
 The output is unchanged: the CAWG ICA credential of <<ica>>, verified by content verifiers exactly as <<CAWG-IA>> §8.1.5 describes, without any reference to the DIDComm conversation.
 
-Status: proposed. Not implemented. No standardized CAWG-over-DIDComm protocol exists; this is a Macawg profile. Every `macawg/…` format, message type and problem code in this section is a placeholder in a namespace Macawg would own (<<extension-inventory>>).
+Status: proposed and experimental. Not implemented. No standardized CAWG-over-DIDComm protocol exists; this is a Macawg profile.
+Binding E does not provide G10 (<<e-g10>>), and provides G5 and G6 only under issuer-trusted consent (<<e-consent>>). Every `macawg/…` format, message type and problem code in this section is a placeholder in a namespace Macawg would own (<<extension-inventory>>).
 
 [[e-architecture]]
 === Architecture
@@ -2412,7 +2443,7 @@ The device is not the CAWG named actor, and receiving the credential does not ma
 |—
 
 |ICA issuer
-|A `did:web` DID with an `assertionMethod` key (<<CAWG-IA>> §8.1.4.2, §8.1.4.3), and a DIDComm messaging DID, which may be the same DID with a `keyAgreement` key and a `DIDCommMessaging` service
+|One `did:web` DID whose document has an `assertionMethod` key (<<CAWG-IA>> §8.1.4.2, §8.1.4.3), a `keyAgreement` key and a `DIDCommMessaging` service. The same DID signs credentials and sends DIDComm messages (<<e-issuer-did>>).
 |Authcrypts offers and credentials. Signs the ICA credential with its `assertionMethod` key. Keeps the approval record.
 |The device, through `audience` and `accepted_issuers`. Content verifiers, through their trusted-ICA list (<<CAWG-IA>> §8.1.5).
 
@@ -2460,8 +2491,14 @@ Successful resolution shows that the chain matches the predicates.
 It does not, by itself, authorize anything (<<DIDX509>> §3); the policy entry does.
 did:x509 requires at least two certificates in the chain (<<DIDX509>> §7), so a request whose `x5chain` holds only the leaf fails this check.
 
+[[e-issuer-did]]
 ICA issuer::
 This binding uses `did:web` issuers. A did:x509 ICA issuer is not supported in this version (<<e-interop>>).
++
+The issuer MUST use one DID both to sign credentials and as its DIDComm `from`. That DID MUST equal the request's `audience`.
+A device MUST NOT accept `approval-pending`, an offer or a credential from any other DIDComm sender.
+Matching an `issuer` value inside a message only checks an asserted identifier; it does not authorize the sender. Using one DID makes the authenticated DIDComm sender and the credential issuer the same identity.
+A later version may allow a separate messaging DID, but only with an authenticated delegation, or a preconfigured association, between the two complete DIDs.
 
 Actor evidence::
 A certificate presented as evidence of the actor's identity is the issuer's evidence policy, and is out of scope.
@@ -2470,10 +2507,13 @@ The device's certificate MUST NOT be taken as evidence of the actor's identity.
 [[e-messages]]
 === Messages and attachments
 
-All messages use the DIDComm v2 plaintext structure inside an authcrypt envelope (<<DIDCOMM>>): `from` is REQUIRED, every message in the exchange carries `thid` set to the proposal's `id`, and each message sets `expires_time` no later than the request's acceptance deadline.
+All messages use the DIDComm v2 plaintext structure inside an authcrypt envelope (<<DIDCOMM>>), with `from` REQUIRED and an `expires_time` header no later than the request's acceptance deadline.
+
+* The four Issue Credential messages form the main thread: each carries `thid` set to the proposal's `id`.
+* `approval-pending`, `credential-accepted` and problem reports are child messages: each carries `pthid` set to the main thread's id, and no `thid` of the main thread.
 Type URIs use the protocol version, `https://didcomm.org/issue-credential/3.0/<message>`, not the `%VER` placeholder of the <<IC3>> text.
-`body.goal_code` is `macawg.cawg-identity-attestation` *(proposed)*; `credential_preview` is not used, because app-supplied values are not evidence.
-Each message carries exactly one Macawg attachment, with `data.base64` (base64url, <<DIDCOMM>>) holding the exact octets; `data.json` and `data.links` MUST NOT be used, so that the octets that are hashed survive transport.
+`body.goal_code` is `macawg.cawg-identity-attestation` *(proposed)*. It is REQUIRED in `propose-credential` and `offer-credential`, and OPTIONAL in `request-credential` and `issue-credential`. `credential_preview` is not used, because app-supplied values are not evidence.
+Each of the four Issue Credential messages carries exactly one Macawg attachment, with `data.base64` (base64url, <<DIDCOMM>>) holding the exact octets; `data.json` and `data.links` MUST NOT be used, so that the octets that are hashed survive transport.
 
 [cols="2,3,2,3",options="header"]
 |===
@@ -2485,9 +2525,10 @@ Each message carries exactly one Macawg attachment, with `data.base64` (base64ur
 |`issue-credential` |`macawg/cawg-ica-credential@v1` |`application/cose; cose-type="cose-sign1"` (<<RFC9052>> §2, §11.3.1) |The tagged `COSE_Sign1` of the ICA credential
 |===
 
-The issuer tells the device that approval is pending with a child-thread message *(proposed)*:
-`https://macawg.example/approval/1.0/approval-pending`, with `pthid` set to the Issue Credential thread and a body `{"approval_uri": ..., "expires_time": ...}`.
-<<IC3>> has no message for this, and the approval leg is deliberately not part of Issue Credential.
+Two child messages are Macawg's own *(proposed; placeholder URIs)*, because <<IC3>> has neither, and the approval leg is deliberately not part of Issue Credential:
+
+* `https://macawg.example/approval/1.0/approval-pending`, issuer to device: body `{"approval_uri": ...}`. Its `expires_time` header is the approval's expiry.
+* `https://macawg.example/issuance/1.0/credential-accepted`, device to issuer: body `{"offer_id": ..., "credential_digest": ...}`, where `credential_digest` is the base64url SHA-256 of the issued `COSE_Sign1`. Its meaning is defined in <<e-states>>.
 
 [[e-offer]]
 ==== The offer object
@@ -2517,9 +2558,16 @@ Identifiers, status entries and other issuer-generated members are excluded by t
 * DIDs are compared as exact strings, without fragment.
 * The COSE algorithm and headers follow <<ica-cose>> and <<ica-cose-profile>>. DIDComm algorithms follow <<DIDCOMM>>: authcrypt with ECDH-1PU+A256KW and A256CBC-HS512.
 
-No response proof is used in this binding.
-The issued credential arrives on the authenticated thread, and its payload is fixed by an offer that commits to `request_digest`; the issuer issues only against an approval for that digest.
-That gives the device G10's guarantee, but not in a form a third party can verify: authcrypt is repudiable.
+[[e-g10]]
+==== No G10: an authenticated issuance session instead
+
+G10 requires the key that made the identity signature to sign both a digest of the exact request and a digest of the exact signature bytes (<<response-proof>>).
+Binding E has no such signature: the ICA signature covers only the credential payload, and DIDComm authenticates messages with a `keyAgreement` key, which is a different key, in a way the recipient can verify but cannot show to anyone else (<<DIDCOMM>>).
+So binding E does not provide G10.
+
+* A device MUST NOT set `response_proof_required` in a binding E request, and an issuer MUST reject a proposal that sets it, with `e.p.macawg.unsupported-requirement`.
+* Binding E provides instead an _authenticated issuance session_: the device knows, from authcrypt on one thread with the `audience` DID, that the issuer it named sent an offer committing to this `request_digest`, and then a credential whose payload equals that offer. It relies on the issuer having issued only against an approval for that digest.
+* This is weaker than G10 in two ways: it rests on trusting the issuer's approval process, and nothing about it can be shown to a third party.
 
 [[e-validation]]
 === Validation steps
@@ -2532,11 +2580,16 @@ Issuer, on `propose-credential`::
 . The certificate satisfies the requester policy (<<e-requester>>).
 . If `accepted_issuers` is non-empty, it contains the issuer's DID.
 . `session_id` and `nonce` have not been seen before from this requester.
+. `response_proof_required` is absent or `false` (<<e-g10>>).
 
 On any failure the issuer sends a problem report and involves no actor.
 
+Device, on `approval-pending`::
+. The envelope is authcrypt from the DID in `audience` (<<e-issuer-did>>), using a `keyAgreement` key in that DID's document, and its `pthid` is the main thread.
+. `approval_uri` is an HTTPS URI on the host of the `audience` `did:web` DID.
+
 Device, on `offer-credential`::
-. The envelope is authcrypt from the issuer's messaging DID, on the thread.
+. The envelope is authcrypt from the DID in `audience`, on the main thread.
 . `request_digest` equals the digest of the request it sent; `issuer` equals `audience` and is accepted.
 . The decoded `credential_payload` passes the credential checks of <<device-ica>> that apply to an unsigned payload: properties, structural values, `c2paAsset` equal to `signer_payload`, and identities that answer `requested`.
 . `expires_at` has not passed, and a credential with this payload would fit `max_signature_size`.
@@ -2547,6 +2600,7 @@ Issuer, on `request-credential`::
 . The session state allows issuance (<<e-states>>).
 
 Device, on `issue-credential`::
+. The envelope is authcrypt from the DID in `audience`, on the main thread.
 . The attachment is a tagged `COSE_Sign1` whose payload equals the offer's `credential_payload`.
 . It passes every check of <<device-ica>>, with the issuer key resolved from the `did:web` document.
 . It fits `max_signature_size`.
@@ -2566,6 +2620,18 @@ At the URI, the issuer:
 . shows the identity values it holds for this actor that answer the request, and that they will be published in the asset;
 . lets the actor approve, reject, or revise by deselecting optional identities;
 . on approval, writes the approval record, then sends the offer. On rejection, sends a problem report that contains no identity data.
+
+[[e-consent]]
+==== Issuer-trusted consent
+
+In bindings A and B, the wallet checks the issued credential against the person's approval before it releases anything (<<wallet-release>>), so a dishonest issuer is caught before the device receives the bytes.
+In binding E the issuer shows the request, records the approval, builds the offer, signs the credential, and delivers it.
+No independent party checks that the offer contains exactly what the person approved.
+The offer commitment stops the offer from changing afterwards; it does not show that the offer matches the approval.
+
+So binding E provides G5 and G6 only under an _issuer-trusted consent_ model: the device, and the person, trust the issuer to present the request faithfully and to issue only the approved selection.
+This is the same issuer the device already trusts for G7, but it is a wider trust: the issuer now also controls disclosure.
+A later version could add an independent check, such as an approval signed by the person's wallet over the offer commitment and verified by the device. That would need its own format (<<e-decisions>>).
 
 The approval record is private issuer state, not portable evidence:
 
@@ -2607,15 +2673,23 @@ Issuer, per thread; every transition is one atomic, durable write:
 |_awaiting-approval_ |Actor rejects |_rejected_ (problem report, no data)
 |_awaiting-approval_, _offer-sent_ |Request or offer deadline passes |_expired_
 |_offer-sent_ |Valid `request-credential`; credential signed and stored |_issued_
+|_offer-sent_ |Issuance interrupted, for example a signing service failure |_offer-sent_ (`e.offer-sent.macawg.interrupted`); the device may resend `request-credential`
 |_issued_ |Same `offer_id` and `offer_commitment` again |_issued_: re-send the stored credential bytes, sign nothing new
-|_issued_ |`ack` received, or retention period ends |_done_
+|_issued_ |`credential-accepted` whose `offer_id` and `credential_digest` match |_done_: the issuer may delete the stored bytes
+|_issued_ |Retention period ends without `credential-accepted` |_done_
 |===
 
 * A new or different `request-credential` in any other state gets a problem report.
 * The device cannot change an approved request. To change anything, it sends a new proposal on a new thread, which needs a new approval. If the actor revises the selection, the offer reflects the revision, and the device may accept it or abandon the thread.
-* <<IC3>> resets both sides on any error and defines no re-send of `issue-credential`. This profile adds the idempotent re-send above, and keeps the issued bytes until the device acknowledges them or the offer expires plus a retention period.
+* <<IC3>> resets both sides on any error and defines no re-send of `issue-credential`. This profile adds the idempotent re-send above, and keeps the issued bytes until `credential-accepted` or the end of a retention period after the offer expires.
+* An ordinary DIDComm acknowledgement means only that a message arrived: <<DIDCOMM>> asks for an ACK "as soon as the message is received". It MUST NOT be taken as acceptance, and MUST NOT let the issuer delete anything.
 
-Device, per thread: _proposal-sent_ → _awaiting-approval_ → _offer-received_ → _request-sent_ → _credential-received_ → _done_ (after `ack`), with _abandoned_ on a problem report or expiry. A device that times out in _request-sent_ resends the same `request-credential` until the offer expires.
+Device, per thread: _proposal-sent_ → _awaiting-approval_ → _offer-received_ → _request-sent_ → _credential-received_ → _committed_ → _done_.
+
+* _credential-received_ → _committed_: after the device has verified the credential (<<e-validation>>), it durably stores the credential and everything it needs to finish the asset, in one atomic write, as the durable acceptance rules of binding A require (<<session-state>>).
+* _committed_ → _done_: the device sends `credential-accepted`. It MUST NOT send it before the commit. After a restart in _committed_, it finishes the asset from the stored credential, and resends `credential-accepted` if it has no evidence that it was delivered.
+* Problem reports change the device's state according to their DIDComm scope (<<e-errors>>): scope `p` moves the device to _abandoned_; scope `m` rejects only the message the device sent, and leaves the state unchanged; a state-name scope moves the device back to the state it names.
+* A device that times out in _request-sent_ resends the same `request-credential` until the offer expires.
 
 [[e-errors]]
 === Problem reports
@@ -2625,16 +2699,19 @@ Problem reports use DIDComm report-problem 2.0, with `pthid` set to the thread (
 [cols="3,4",options="header"]
 |===
 |Code |Meaning
-|`e.p.macawg.rejected` |The actor rejected. Carries no identity data.
-|`e.p.macawg.unsupported-format` |Unknown attachment format, media type or data encoding.
-|`e.p.macawg.unsupported-did-method` |A DID the receiver cannot resolve.
-|`e.p.macawg.expired` |The request, approval or offer has expired.
-|`e.p.macawg.changed-content` |A `request-credential` that does not match the offer.
-|`e.p.trust.macawg.untrusted-requester` |The requester policy, `requester_did` or `audience` check failed.
-|`e.p.macawg.evidence-unavailable` |The issuer cannot verify an identity it would need.
-|`e.p.macawg.signature-failed` |The request's COSE signature or chain failed.
-|`e.p.macawg.interrupted` |Issuance was interrupted; the device may resend the same `request-credential`.
+|`e.p.macawg.rejected` |The actor rejected. Carries no identity data. Terminal.
+|`e.p.macawg.unsupported-format` |Unknown attachment format, media type or data encoding. Terminal.
+|`e.p.macawg.unsupported-did-method` |A DID the receiver cannot resolve. Terminal.
+|`e.p.macawg.unsupported-requirement` |The proposal sets `response_proof_required` (<<e-g10>>). Terminal.
+|`e.p.macawg.expired` |The request, approval or offer has expired. Terminal.
+|`e.m.macawg.changed-content` |A `request-credential` that does not match the offer. Only that message is rejected; the offer stands, and the device may send a correct request.
+|`e.p.trust.macawg.untrusted-requester` |The requester policy, `requester_did` or `audience` check failed. Terminal.
+|`e.p.macawg.evidence-unavailable` |The issuer cannot verify an identity it would need. Terminal.
+|`e.p.macawg.signature-failed` |The request's COSE signature or chain failed. Terminal.
+|`e.offer-sent.macawg.interrupted` |Issuance was interrupted. The issuer is back in _offer-sent_, and the device may resend the same `request-credential`. Recoverable.
 |===
+
+The scope follows <<DIDCOMM>>: `p` abandons the protocol, `m` rejects one message and leaves the state unchanged, and a state name reverts the sender to that state.
 
 [[e-examples]]
 === Examples
@@ -2687,9 +2764,9 @@ The signed request inside it is a binding A request with these changes: `request
   "from": "did:web:ica.example",
   "to": ["<device messaging DID>"],
   "pthid": "<uuid-1>",
+  "expires_time": 1792040600,
   "body": {
-    "approval_uri": "https://ica.example/approve/<approval handle>",
-    "expires_time": 1792040600
+    "approval_uri": "https://ica.example/approve/<approval handle>"
   }
 }
 ----
@@ -2704,6 +2781,7 @@ The signed request inside it is a binding A request with these changes: `request
   "from": "did:web:ica.example",
   "to": ["<device messaging DID>"],
   "thid": "<uuid-1>",
+  "expires_time": 1792040600,
   "body": { "goal_code": "macawg.cawg-identity-attestation" },
   "attachments": [
     {
@@ -2727,7 +2805,7 @@ The signed request inside it is a binding A request with these changes: `request
 }
 ----
 
-`request-credential`, and `issue-credential`:
+`request-credential`, `issue-credential`, and `credential-accepted`:
 
 [source,json]
 ----
@@ -2737,6 +2815,7 @@ The signed request inside it is a binding A request with these changes: `request
   "from": "<device messaging DID>",
   "to": ["did:web:ica.example"],
   "thid": "<uuid-1>",
+  "expires_time": 1792040600,
   "body": {},
   "attachments": [
     {
@@ -2757,7 +2836,7 @@ The signed request inside it is a binding A request with these changes: `request
   "from": "did:web:ica.example",
   "to": ["<device messaging DID>"],
   "thid": "<uuid-1>",
-  "please_ack": ["<uuid-5>"],
+  "expires_time": 1792040600,
   "body": {},
   "attachments": [
     {
@@ -2767,6 +2846,22 @@ The signed request inside it is a binding A request with these changes: `request
       "data": { "base64": "<base64url of the tagged COSE_Sign1>" }
     }
   ]
+}
+----
+
+[source,json]
+----
+{
+  "id": "<uuid-6>",
+  "type": "https://macawg.example/issuance/1.0/credential-accepted",
+  "from": "<device messaging DID>",
+  "to": ["did:web:ica.example"],
+  "pthid": "<uuid-1>",
+  "expires_time": 1792040600,
+  "body": {
+    "offer_id": "<the offer's offer_id>",
+    "credential_digest": "<base64url SHA-256 of the tagged COSE_Sign1>"
+  }
 }
 ----
 
@@ -2781,7 +2876,11 @@ The signed request inside it is a binding A request with these changes: `request
 |Message sequence |Existing standard, profile constraint |<<IC3>>; must start with a proposal; the offer is required
 |Message type URIs |Profile constraint |`issue-credential/3.0/…` in place of `%VER`
 |Attachment `format`, not a body `formats` list |Profile constraint |<<IC3>>'s 3.0 change aligns attachments with DIDComm v2; its 2.0 change-log text about a `formats` field does not apply
-|Acknowledgement |Existing standard |DIDComm `please_ack` and `ack` headers, in place of the DIDComm v1 `~please-ack` decorator that the <<IC3>> text still uses
+|Acknowledgement of receipt |Existing standard |DIDComm `please_ack` and `ack` headers, in place of the DIDComm v1 `~please-ack` decorator that the <<IC3>> text still uses. They mean receipt only.
+|Acceptance after durable storage |New semantic extension |`credential-accepted` (<<e-states>>); the <<IC3>> text's "OUTCOME" acknowledgement has no DIDComm v2 equivalent
+|G10 |Not provided |Authenticated issuance session instead (<<e-g10>>)
+|G5 and G6 |Profile constraint |Issuer-trusted consent (<<e-consent>>)
+|Issuer messaging identity |Profile constraint |One DID for signing and messaging (<<e-issuer-did>>)
 |Proposal, offer, request and credential contents |New attachment |Four `macawg/…` formats (<<e-messages>>)
 |Certificate-backed requester |Existing (Macawg G1) |C2PA `COSE_Sign1` with `x5chain`
 |Binding the C2PA certificate to the messaging DID and the issuer |New semantic extension |`requester_did`, `audience` (<<e-requester>>)
@@ -2841,6 +2940,11 @@ Resolver implementations exist for the requester-policy use: Microsoft's Python 
 |`requester_did` differs from DIDComm `from`, or `audience` differs from the issuer |`untrusted-requester`.
 |Malformed response: `data.json` instead of `base64`, duplicate JSON members, trailing data, untagged COSE, wrong media type |Rejected; `unsupported-format`.
 |Actor rejects |`rejected` with no identity data; the device learns nothing else.
+|Proposal sets `response_proof_required` |`unsupported-requirement`.
+|`approval-pending`, offer or credential from a DID other than `audience` |Device rejects, before showing any approval URI.
+|Device receives the credential, sends a DIDComm receipt ACK, then crashes before committing |The issuer still holds the bytes; the device resends `request-credential` and receives them again. Only `credential-accepted` releases them.
+|Issuance interrupted |`e.offer-sent.macawg.interrupted`; the device stays in _request-sent_, resends, and receives one credential.
+|A `request-credential` that does not match the offer |`e.m.macawg.changed-content`; the offer stands.
 |Final-signer mismatch |Not tested: this binding does not claim the requester signs the final claim.
 |===
 
@@ -2852,13 +2956,15 @@ Resolver implementations exist for the requester-policy use: Microsoft's Python 
 |Decision |Recommended default |Consequence
 |How approval-pending is signalled |A Macawg child-thread message |Needs a Macawg-owned message type; Issue Credential stays unmodified.
 |Approval record |Private issuer state |Simple, and leaks nothing; but no third party can audit an approval. A portable, issuer-signed record would need its own format and privacy review.
+|Independent approval check |None: issuer-trusted consent |Simple; the issuer controls disclosure. A wallet-signed approval over the offer commitment, verified by the device, would restore an independent G5 check, at the cost of a wallet key and a new format.
+|Issuer messaging identity |One DID |Simple and verifiable; a separate messaging DID would need a delegation format.
 |Offer content |Exact payload octets |Removes all comparison ambiguity; `validFrom` is fixed when the offer is made.
 |ICA issuer DID method |`did:web` only |Works with CAWG validators today; did:x509 issuers wait for CAWG validator support.
 |Requester policy |did:x509 identifiers over the C2PA chain |Pins a CA and subject rather than a leaf, so it survives certificate renewal and key rotation; pinning a leaf breaks at each renewal, and pinning a key at each rotation.
 |Credential media type |`application/cose; cose-type="cose-sign1"` |Registered in <<RFC9052>>; `application/vc+cose` was not checked for this draft.
-|Response proof |Not used |G10 holds for the device only; a third party cannot verify the request-to-result link.
+|Response proof |Not supported |Binding E does not provide G10; devices that need it use bindings A and B.
 |Device reachability |A DIDComm mediator for devices without an endpoint |Adds a mediator dependency; a device with an endpoint needs none.
-|Acknowledgement |`please_ack` on `issue-credential` |Lets the issuer release stored bytes; without it, the issuer keeps them until the offer expires plus retention.
+|Release of stored credentials |`credential-accepted`, after the device's durable commit |Needs a Macawg message; receipt ACKs cannot be used, so without it the issuer keeps the bytes until the retention period ends.
 |===
 
 [[e-conclusion]]
@@ -2870,9 +2976,12 @@ The minimum additions are:
 . four attachment formats (<<e-messages>>);
 . the signed request members `requester_did` and `audience` (<<e-requester>>);
 . the approval leg, the `approval-pending` message and the private approval record (<<e-approval>>);
-. profile rules on Issue Credential 3.0: proposal first, required offer, offer commitment, idempotent re-issue, DIDComm v2 headers, problem codes (<<e-states>>, <<e-errors>>);
+. profile rules on Issue Credential 3.0: proposal first, required offer, offer commitment, idempotent re-issue, DIDComm v2 headers, problem codes with the right scopes (<<e-states>>, <<e-errors>>);
+. the `credential-accepted` message, sent only after durable storage;
+. one issuer DID for signing and messaging;
 . a requester policy, optionally expressed as did:x509 identifiers.
 
+It does not provide G10, and provides G5 and G6 only under issuer-trusted consent, so it is weaker than bindings A and B together, and is marked experimental.
 It stays proposed while Issue Credential 3.0 is a draft with unverified library support, and while device reachability without an endpoint needs a mediator.
 
 Direct X.509 signing (`cawg.x509.cose`) is the alternative when the actor holds a certificate: the actor signs, no issuer is involved, and this binding is not needed. Its DIDComm or OpenID4VP carriage is not specified here (<<binding-d>>).
@@ -3039,6 +3148,7 @@ A receiver MUST reject an input that exceeds them, and MUST check sizes as recei
 |`nonce`, `n` |16 to 64 characters from the base64url alphabet; at least 128 bits of entropy (<<invite>>)
 |`reason` |At most 256 bytes of UTF-8
 |`version` |The integer `1`
+|`dt`, `delivery_token` *(proposed)* |16 to 64 characters from the base64url alphabet; at least 128 bits of entropy
 |`k`, `session_key` *(proposed)* |Exactly 43 characters from the base64url alphabet, decoding to 32 bytes
 |===
 
@@ -3381,9 +3491,10 @@ The `macawg_` names are placeholders: the namespace (a CAWG-registered URI, or a
 |`cawg` |Member of CSC `x509PresentationResponse` |OpenID4VP with <<CSC-DMB>> |Proposed; needs CSC agreement
 |`macawg/cawg-ica-proposal@v1`, `macawg/cawg-ica-offer@v1`, `macawg/cawg-ica-request@v1`, `macawg/cawg-ica-credential@v1` |DIDComm attachment formats |Binding E |Proposed
 |`requester_did`, `audience` |Request members |Binding E |Proposed
-|`https://macawg.example/approval/1.0/approval-pending` |DIDComm message type (placeholder URI) |Binding E |Proposed
+|`https://macawg.example/approval/1.0/approval-pending`, `https://macawg.example/issuance/1.0/credential-accepted` |DIDComm message types (placeholder URIs) |Binding E |Proposed
+|`dt`, `delivery_token_hash`, `delivery_token` |Invite parameter, request member, response member |Bindings A and B (<<delivery-token>>) |Proposed
 |`macawg.cawg-identity-attestation` |`goal_code` |Binding E |Proposed
-|`e.p.macawg.*`, `e.p.trust.macawg.untrusted-requester` |Problem-report codes |Binding E |Proposed
+|`e.p.macawg.*`, `e.m.macawg.changed-content`, `e.offer-sent.macawg.interrupted`, `e.p.trust.macawg.untrusted-requester` |Problem-report codes |Binding E |Proposed
 |`macawg.cawg-ica-offer.v1` |Offer-commitment hash prefix |Binding E |Proposed
 |`k` |Invite parameter |BLE transport |Proposed
 |`session_key` |Request member |BLE transport |Proposed
@@ -3422,8 +3533,9 @@ Proposed, lower priority::
 Store-and-forward, for when neither side is online at the scan.
 It keeps keys and requests for days, and needs persistence on the device, so it should follow the BLE transport, not precede it.
 
-Proposed::
+Proposed, experimental::
 Binding E, DIDComm Issue Credential 3.0 between the device and the ICA issuer.
+It does not provide G10, and relies on issuer-trusted consent for G5 and G6.
 It uses the CAWG ICA output unchanged, but rests on a protocol that is still a draft, needs four new attachment formats and an approval leg, and needs a mediator for devices without a DIDComm endpoint (<<e-conclusion>>).
 
 Evaluation only::
@@ -3462,6 +3574,7 @@ Persistent device state, a resumption after a power cycle, a `session_unusable` 
 An issuer that accepts proposals, runs the approval leg and issues against offers; a device that proposes, checks offers and credentials, and acknowledges.
 Vectors: a proposal attachment for the binding A example request with `requester_did` and `audience`; an offer object and its `offer_commitment`; the `request-credential` attachment; the issued `COSE_Sign1` and its payload equality with the offer.
 Rejection cases: those in <<e-acceptance>>.
+Binding B: an issuer that submits a response directly to the device, without the delivery token, which the device must reject.
 . *Namespace.* Decide who owns the `macawg_` and `macawg/` identifiers, and register or rename them.
 
 [appendix]
@@ -3536,6 +3649,7 @@ A helper being available does not mean that a given wallet or device calls it.
 |Binding B `macawg_ica_dataset` type, `locations`, `macawg_not_after` |Not implemented |—
 |Store-and-forward |Not implemented |—
 |Binding E (DIDComm Issue Credential 3.0) |Not implemented |—
+|Delivery token (`dt`, `delivery_token_hash`, `delivery_token`) |Not implemented |—
 |Proof AAD `macawg.sign_response.oid4vp.v1` |Not implemented |—; `tests/vectors.rs` checks that a proof made with it does not verify under binding A
 |Binding A test vectors (<<impl-tasks>> item 1) |Library |`tests/vectors.rs`
 |===
@@ -3574,6 +3688,14 @@ Redirect handling belongs to the application's HTTP client.
 [appendix]
 [[changelog]]
 == Change log (informative)
+
+0.15-draft::
+* Added the delivery token (`dt`, `delivery_token_hash`, `delivery_token`), so that an issuer that receives the signed request in binding B cannot deliver a response itself and bypass the wallet's release checks (<<delivery-token>>). Binding C needs an equivalent before binding B can use a proof under it. Updated binding B's privacy notes.
+* Binding E: no longer claims G10; defined an authenticated issuance session instead, and made issuers reject `response_proof_required` (<<e-g10>>). Named the issuer-trusted consent model for G5 and G6 (<<e-consent>>). Marked binding E experimental.
+* Binding E: one issuer DID for signing and messaging, checked before accepting `approval-pending` (<<e-issuer-did>>).
+* Binding E: added `credential-accepted`, sent only after durable storage; receipt ACKs no longer release stored credentials.
+* Binding E: problem codes use DIDComm scopes correctly; `interrupted` reverts to _offer-sent_, and `changed-content` rejects one message. Defined the device's response to each scope.
+* Binding E: scoped `thid`, attachments and `goal_code` to the right messages; added `expires_time` headers to the examples.
 
 0.14-draft::
 * Added binding E, a proposed profile of DIDComm Issue Credential 3.0 between the device and the ICA issuer, with a separate approval leg (<<binding-e>>). It defines four attachment formats, the `requester_did` and `audience` request members, an `approval-pending` message, a private approval record, exact byte rules and an offer commitment, a state machine with idempotent re-issue, problem codes, examples, a requirements mapping, an interoperability assessment, acceptance cases and remaining decisions.
