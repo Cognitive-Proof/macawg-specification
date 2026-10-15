@@ -7,7 +7,7 @@
 :sectanchors:
 :icons: font
 :source-highlighter: rouge
-:revnumber: 0.10-draft
+:revnumber: 0.11-draft
 :revdate: 2026-10-14
 :cawg-ia: https://cawg.io/identity/1.3/
 :c2pa-spec: https://c2pa.org/specifications/specifications/2.2/specs/C2PA_Specification.html
@@ -1243,6 +1243,9 @@ The wallet MAY retry until the acceptance deadline.
 The device SHOULD rate-limit submissions per session.
 * A valid `declined` response ends the session.
 * When the device accepts a valid response, signed or declined, it MUST record the outcome and the SHA-256 of the complete sign response, atomically with marking the session finished.
+* _Accepted_ means durably committed. Before it reports acceptance (HTTP 2xx, or a BLE `RESULT` `accepted`), the device MUST have durably stored, in the same atomic commit as the finished record, either the completed asset with the identity assertion, or the `signature` bytes, any `response_proof`, and all the asset and claim state it needs to finish the asset after a restart.
+* The session then has one of three persisted states: _open_; _accepted, awaiting finalization_; and _applied_, once the completed asset is durably stored. After a restart, a device in the second state MUST finish the asset from the stored signature, and MUST NOT ask for or accept a new one.
+If power fails before the commit, nothing was accepted, and a retry is processed as a new response.
 The complete sign response is the JSON octets of the response exactly as received: the HTTP request body for HTTPS, or the decrypted RESPONSE plaintext for BLE. Framing, fragmentation and encryption are not part of it, so they may differ between attempts.
 * A retry is _identical_ when its sign response octets have the same SHA-256 as the recorded one. The comparison is on the octets, with no parsing or canonicalization.
 The wallet MUST store the octets of its sign response and resend exactly those octets.
@@ -1336,7 +1339,7 @@ The signed request for a BLE session carries the same key:
 `session_key` *(proposed)*::
 REQUIRED when the transport is BLE, and absent otherwise. The base64url encoding of `pkD`.
 It is covered by the device's COSE signature, as `session_url` is for HTTPS.
-The device SHOULD list `session_key` in `crit` (<<extensions>>), so that a wallet that does not implement this transport rejects the request instead of ignoring the key.
+The device MUST list `session_key` in `crit` (<<extensions>>), so that a wallet that does not implement this transport rejects the request instead of ignoring the key.
 
 `session_url` MUST be absent from a BLE request.
 
@@ -1365,12 +1368,15 @@ The service has three characteristics *(proposed; placeholder UUIDs)*:
 |Characteristic |UUID |Properties |Carries
 
 |Key exchange |`6d616361-7767-4001-8000-000000000001` |Write |`HELLO` frames, wallet to device
-|Request |`6d616361-7767-4001-8000-000000000002` |Notify |`REQUEST`, `RESULT` and `ERROR` frames, device to wallet
+|Request |`6d616361-7767-4001-8000-000000000002` |Indicate |`REQUEST`, `RESULT` and `ERROR` frames, device to wallet
 |Response |`6d616361-7767-4001-8000-000000000003` |Write |`RESPONSE` and `ERROR` frames, wallet to device
 |===
 
 * Writes MUST use Write Characteristic Value, which the server acknowledges (Bluetooth Core <<BT-CORE>> Vol 3, Part G, §4.9.3). Write Without Response MUST NOT be used, because it gives the sender no flow control.
-* The device sends with notifications (Part G, §4.10). The wallet MUST enable them through the Client Characteristic Configuration Descriptor before it writes a `HELLO`.
+* The device sends with indications (Part G, §4.11; Part F, §3.4.7.2), and MUST wait for the wallet's confirmation (Part F, §3.4.7.3) before it sends the next fragment. The wallet MUST enable indications through the Client Characteristic Configuration Descriptor before it writes a `HELLO`.
+* Notifications MUST NOT be used. On an unenhanced ATT bearer, a receiver discards notifications it cannot process because its buffers overflow (Part F, §3.3.2), and the framing has no sequence numbers or retransmission, so one lost notification would make the whole frame unusable, and a reconnection could fail the same way.
+* So every fragment, in both directions, is acknowledged before the next is sent: writes by the write response, indications by the confirmation. This gives reliable, ordered delivery on the connection's one ATT bearer, at the cost of one round trip per fragment.
+* All frames of a connection MUST use the single unenhanced ATT bearer on the LE fixed channel. Enhanced ATT bearers MUST NOT be used, so that fragments of both directions stay in order.
 * The characteristics MUST NOT require link-layer encryption or authentication, because the binding does not pair. The device MAY accept link-layer encryption if the wallet sets it up, but neither side relies on it.
 
 [[ble-framing]]
@@ -1388,7 +1394,7 @@ Each message is a _frame_:
 |===
 
 A frame is sent as a sequence of fragments.
-Each fragment is one characteristic write, or one notification, of at most `min(ATT_MTU − 3, 512)` bytes. `ATT_MTU − 3` is the largest value a write request or a notification can carry (<<BT-CORE>> Vol 3, Part F, §3.4.5.1, §3.4.7.1), and 512 octets is the maximum length of an attribute value (Part F, §3.2.9). For example, an `ATT_MTU` of 517 would allow 514 bytes, which exceeds the attribute limit.
+Each fragment is one characteristic write, or one indication, of at most `min(ATT_MTU − 3, 512)` bytes. `ATT_MTU − 3` is the largest value a write request or an indication can carry (<<BT-CORE>> Vol 3, Part F, §3.4.5.1, §3.4.7.2), and 512 octets is the maximum length of an attribute value (Part F, §3.2.9). For example, an `ATT_MTU` of 517 would allow 514 bytes, which exceeds the attribute limit.
 Fragments are the frame's bytes in order, with no header of their own.
 The receiver concatenates fragments until it has read the 6-byte header and then `length` more bytes.
 The next fragment begins the next frame.
@@ -1396,9 +1402,10 @@ The next fragment begins the next frame.
 * The default LE `ATT_MTU` is 23 (<<BT-CORE>> Vol 3, Part G, §5.2.1), which gives 20-byte fragments. The wallet SHOULD run the Exchange MTU procedure (Part G, §4.3.1) before it writes a `HELLO`; ATT then uses the smaller of the two sides' receive MTUs (Part F, §3.4.2.2).
 * Because fragments never exceed `ATT_MTU − 3`, no fragment needs the long-write procedures (Part F, §3.2.9).
 * A receiver MUST check `version`, `type` and `length` as soon as it has the header, and abort if `length` exceeds the frame maximum: 1 MiB plus 84 bytes for REQUEST (32 for `enc_d`, 36 for `challenge` and `remaining`, 16 for the tag), 128 KiB plus 16 bytes for RESPONSE, and 4 KiB for the other types (<<resource-limits>>).
-* A receiver MUST abort if more than 30 seconds pass between fragments of one frame. This matches the ATT transaction timeout (Part F, §3.3.3).
+* The ATT transaction timeout of 30 seconds (Part F, §3.3.3) applies to each write and each indication. It does not cover a message that never starts, so the binding defines its own timers, in <<ble-timers>>.
 
-Throughput at small MTUs is low, so a device SHOULD keep BLE request envelopes small. In particular, it SHOULD keep any `context.thumbnail` under 16 KiB.
+Throughput at small MTUs is low, and acknowledging every fragment lowers it further, so a device SHOULD keep BLE request envelopes small. In particular, it SHOULD keep any `context.thumbnail` under 16 KiB.
+*(proposed)* Before this transport becomes normative, implementers should measure the time to deliver realistic requests, for example 4, 16 and 64 KiB, with indications at the `ATT_MTU` values that common phones negotiate. A later version may define notification flow control with sequence numbers and retransmission if indications prove too slow.
 
 [[ble-hpke]]
 ==== HPKE
@@ -1427,8 +1434,11 @@ The `info` strings bind both contexts to the session:
 
 ----
 info_w2d = "macawg.ble.v1 wallet-to-device " || sid || " " || nonce
-info_d2w = "macawg.ble.v1 device-to-wallet " || sid || " " || nonce
+info_d2w = "macawg.ble.v1 device-to-wallet " || sid || " " || nonce || " " || h
 ----
+
+where `h` is the base64url SHA-256 of this connection's `enc_w`.
+Including `h` binds the device-to-wallet context, and so the REQUEST and RESULT, to the HELLO that started the connection.
 
 Here `sid` and `nonce` are the invite's values as ASCII. They contain only base64url characters (<<field-lengths>>), so a space separates them without ambiguity.
 The AAD of each `Seal` and `Open` depends on the frame type:
@@ -1485,6 +1495,51 @@ A device MAY accept HELLOs from more than one wallet in a session, as an HTTPS d
 Each connection has its own pair of contexts.
 <<session-state>> still allows only one accepted `signed` response.
 
+[[ble-states]]
+==== One exchange per connection
+
+A connection carries at most one exchange, in this order, with these HPKE sequence numbers:
+
+[cols="1,2,2,1",options="header"]
+|===
+|Step |Frame |Direction |Sequence number
+|1 |HELLO |Wallet to device |0 (wallet-to-device context)
+|2 |REQUEST |Device to wallet |0 (device-to-wallet context)
+|3 |RESPONSE |Wallet to device |1 (wallet-to-device context)
+|4 |RESULT |Device to wallet |1 (device-to-wallet context)
+|===
+
+* After the RESULT, or after the wallet decides not to send a RESPONSE, both sides close the connection. Any later attempt uses a new connection, a new HELLO and new contexts.
+* Either side MUST abort on a frame that is not the next one in this table: for example a second HELLO, a RESPONSE before the REQUEST, or any frame after the RESULT. `ERROR` may arrive at any point.
+* Reassembly buffers and HPKE contexts belong to one connection, and MUST NOT be shared with or carried into another.
+* After a rejected RESPONSE, the wallet may try again only on a new connection.
+
+==== Parsing
+
+A receiver MUST reject a frame, and abort, if its `body` does not consume exactly `length` bytes with the structure defined for its type. In particular:
+
+* HELLO: `sid_len` MUST be from 16 to 64, `sid` MUST be base64url characters, and `length` MUST equal `1 + sid_len + 32 + 49`. Bits 1 to 7 of `flags` are reserved, and MUST be 0.
+* REQUEST: the plaintext MUST be at least 36 bytes, and the `envelope` after `challenge` and `remaining` MUST parse as a request envelope with nothing after it.
+* RESPONSE and RESULT: the plaintext MUST be a single JSON value with nothing after it.
+* ERROR: `length` MUST be 1.
+
+[[ble-timers]]
+==== Timers
+
+[cols="2,1,4",options="header"]
+|===
+|Timer |Limit |On expiry
+|Handshake: from connection to a HELLO that opens |30 s |The device disconnects.
+|REQUEST wait: from writing the HELLO to the first REQUEST fragment |30 s |The wallet disconnects.
+|Whole frame: from a frame's first fragment to its last |5 min |The receiver aborts. This stops a sender from holding a frame open by sending one fragment just before each per-fragment timeout.
+|RESPONSE wait: from the last REQUEST fragment to the first RESPONSE fragment |2 min |The device disconnects. A wallet whose person is still deciding reconnects later with the resume flag (<<ble-resume>>).
+|RESULT wait: from the last RESPONSE fragment to the first RESULT fragment |30 s |The wallet disconnects, and retries the same RESPONSE on a new connection (<<session-state>>). This covers a RESULT that never arrives at all.
+|===
+
+On any expiry, the side discards the connection's state and disconnects. The logical session is kept, and the wallet may reconnect while its deadline allows.
+
+A device MUST bound the number of connections that have not yet completed a HELLO, and SHOULD allow no more than two at a time, so that devices in radio range cannot exhaust it.
+
 [[ble-replay]]
 ==== Replay across connections
 
@@ -1499,8 +1554,14 @@ A replayed RESPONSE carries an old challenge, so it fails to open.
 The replayer cannot learn the new challenge, which is sealed to the `pkW` in the replayed HELLO, and cannot make a new RESPONSE, because it does not know the wallet-to-device key.
 
 This is a small addition to HPKE, not a reviewed handshake.
-*(proposed)* Before this transport becomes normative, the design needs cryptographic review.
-A reviewed alternative is the Noise NK pattern, in which the wallet knows the device's static key in advance, with `sid` and the nonce in the prologue.
+*(proposed)* Before this transport becomes normative, the composed handshake needs cryptographic review.
+The review needs to establish at least:
+
+* that a REQUEST and its RESULT belong to the same HELLO and the same device session, which `h` in `info_d2w` is meant to ensure;
+* that only the device can produce a REQUEST or RESULT the wallet accepts. HPKE base mode does not authenticate a sender (<<RFC9180>> Table 6); the argument rests on `pkW` staying confidential inside the HELLO, which is a property of this composition, not of HPKE;
+* that replayed HELLOs cannot cause key and nonce reuse, or let a RESPONSE open in another connection.
+
+Designs to compare include the Noise NK pattern, in which the wallet knows the device's static key in advance, with `sid` and the nonce in the prologue; and HPKE's exporter-based bidirectional construction (<<RFC9180>> §9.8), which would also need care with replayed HELLOs.
 
 [[ble-resume]]
 ==== Reconnecting
@@ -1518,7 +1579,7 @@ A wallet that does not already hold the request MUST NOT set the flag, and MUST 
 
 In both cases the wallet sets its deadline to the earlier of its existing deadline and `t_hello + remaining`, where `t_hello` is its own time when it wrote this connection's HELLO.
 `remaining` can therefore shorten the wallet's deadline, never extend it.
-Only the device can have sealed `remaining`: `pkW` reached it sealed to `pkD`, so nobody else knows the key to seal to.
+Only the device should be able to seal `remaining`: `pkW` reached it sealed to `pkD`, so nobody else should know the key to seal to. This argument is part of the review in <<ble-replay>>.
 
 [[ble-errors]]
 ==== Errors and abort
@@ -1530,7 +1591,10 @@ It MUST NOT end a session because of one: anyone in radio range can send it, so 
 
 To abort, a side sends an `ERROR` frame if it can, discards both HPKE contexts and any partial frame, and disconnects.
 A new connection always starts with a new HELLO.
-A rejected RESPONSE (`RESULT` with `"rejected"`) leaves the session open, as a 4xx does in <<transport-https>>.
+A rejected RESPONSE (`RESULT` with `"rejected"`) leaves the session open, as a 4xx does in <<transport-https>>, with two exceptions:
+
+* `already_finished`: the session stays finished, with its recorded outcome (<<session-state>>);
+* `session_unusable`: the session has ended, and the wallet MUST delete its state for it (<<store-and-forward>>).
 
 [[ble-vs-tls]]
 ==== What HPKE replaces from TLS
@@ -1546,7 +1610,7 @@ Binding A over HTTPS relies on TLS to hide the request, which carries the nonce,
 |Integrity in transit |TLS |The AEAD, as well as the COSE signature on the request and the identity signature in the response.
 |Destination binding (G3) |`session_url` equals `u`; no redirects |`session_key` equals `k` (<<ble-destination>>)
 |Order and replay |TLS record sequence, and fresh keys per connection |HPKE sequence numbers within a connection; the device's per-connection `challenge` across connections (<<ble-replay>>)
-|Forward secrecy |TLS 1.3 ephemeral key exchange |Both key pairs are ephemeral, and are deleted when the session ends. Store-and-forward keeps `skD` longer (<<store-and-forward>>).
+|Forward secrecy |TLS 1.3 ephemeral key exchange |Limited. Both key pairs are generated for the session, independently of the device's C2PA signing key, so compromise of the C2PA key alone does not reveal them. But the device keeps `skD` until its deadline, even after the session finishes, to answer retries (<<store-and-forward>>), up to 7 days for store-and-forward. Anyone who obtains `skD` with the session's `sid` and nonce can decrypt captured wallet-to-device traffic, including the disclosed identities. HPKE gives no forward secrecy against compromise of the recipient's key (<<RFC9180>> §9.1, §9.7.4). The exposure ends only when the device deletes `skD`.
 |Client authentication |None |None. HPKE base mode does not authenticate the sender (<<RFC9180>> Table 6). The wallet is gated only by knowing the invite.
 |===
 
@@ -2643,7 +2707,7 @@ The last column says whether binding A's wire representation stays unchanged if 
 |Not applicable
 
 |BLE transport
-|GATT characteristics, Write Characteristic Value and notifications, <<BT-CORE>> Vol 3, Part G, §4.9.3, §4.10; MTU exchange, Part F, §3.4.2
+|GATT characteristics, Write Characteristic Value and indications, <<BT-CORE>> Vol 3, Part G, §4.9.3, §4.11; MTU exchange, Part F, §3.4.2
 |Profile: a Macawg-defined service and framing
 |No pairing. Throughput limits the request size.
 |Yes, apart from `session_key` replacing `session_url`
@@ -2768,6 +2832,7 @@ A GATT server on a device and a client in the wallet; framing; HPKE with the fix
 Vectors, made deterministic with HPKE `DeriveKeyPair` from fixed seeds (<<RFC9180>> §7.1.3): `skD`, `pkD`, `skW`, `pkW` and the ephemeral keys; `info_w2d` and `info_d2w` for the example `sid` and nonce; the HELLO, REQUEST, RESPONSE and RESULT frames for the binding A example messages; the same frames fragmented at `ATT_MTU` 23 and 247.
 Rejection cases: a HELLO sealed with the wrong nonce; a `session_key` that differs from `k`; a captured HELLO replayed together with its captured RESPONSE, which must fail at the RESPONSE; a RESPONSE whose AAD carries another connection's `challenge`; a frame whose `length` is too large; a fragment longer than 512 bytes at an `ATT_MTU` of 517; a truncated fragment stream; an unauthenticated `ERROR` that must not end the session; a retransmitted REQUEST that differs from the stored one; an initial-delivery HELLO after `W`; a `remaining` that would extend the wallet's deadline, which must be ignored.
 Lost acknowledgement: an identical RESPONSE after the session finished gets `accepted` again, and is not applied twice; a different one gets `already_finished`.
+Delivery and failure: the first and the last fragment of a REQUEST lost or delayed; a RESULT that never arrives, so the RESULT-wait timer fires and the wallet retries; a frame kept open by one fragment every 29 seconds, which the whole-frame timer must end; power failure before, during and after the acceptance commit, each followed by a retry; two wallets connected at once; and unexpected frame sequences, such as a second HELLO, a RESPONSE before the REQUEST, a frame after the RESULT, a HELLO with a reserved flag bit set, and trailing bytes after a frame body.
 Offline validity: a device without trusted current time records "temporal validity unchecked" without a proof, "issuer-attested validity during the session" with one, and never "full acceptance"; an expired credential delivered with a proof made while it was valid is recorded at the second level, not the first.
 . *Store-and-forward.*
 Persistent device state, a resumption after a power cycle, a `session_unusable` rejection, and a duplicate RESPONSE after the session finished.
@@ -2882,6 +2947,15 @@ Redirect handling belongs to the application's HTTP client.
 [appendix]
 [[changelog]]
 == Change log (informative)
+
+0.11-draft::
+* BLE delivery: the device now sends with indications and waits for each confirmation, because notifications can be discarded on buffer overflow (<<BT-CORE>> Vol 3, Part F, §3.3.2). Every fragment is acknowledged; only the unenhanced ATT bearer is used. Asked for throughput measurements.
+* Added timers for the handshake, the REQUEST wait, whole frames, the RESPONSE wait and the RESULT wait, and a bound on incomplete handshakes (<<ble-timers>>).
+* Defined acceptance as a durable commit, with three persisted states, so that a crash cannot leave an `accepted` session without its signature (<<session-state>>).
+* Defined one exchange per connection with fixed sequence numbers, rejection of unexpected frames, and exact parsing, including reserved flag bits and trailing bytes (<<ble-states>>). Listed the exceptions to "a rejected RESPONSE leaves the session open".
+* Bound the device-to-wallet context to the HELLO with a hash of `enc_w`, and listed what the cryptographic review must establish.
+* Restated forward secrecy: compromise of a retained `skD` exposes wallet-to-device traffic until the device deletes it.
+* `session_key` MUST now be listed in `crit`.
 
 0.10-draft::
 * Named _limited validity mode_ for devices without trusted current time, and made G7, the offline rules and the BLE conformance table say that it does not meet G7's temporal-validity requirement.
