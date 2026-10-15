@@ -7,7 +7,7 @@
 :sectanchors:
 :icons: font
 :source-highlighter: rouge
-:revnumber: 0.13-draft
+:revnumber: 0.14-draft
 :revdate: 2026-10-14
 :cawg-ia: https://cawg.io/identity/1.3/
 :c2pa-spec: https://c2pa.org/specifications/specifications/2.2/specs/C2PA_Specification.html
@@ -35,7 +35,7 @@ Where this document names a crate function, the name is informative.
 
 The document separates the CAWG signing operation (<<operation>>) from the bindings that carry it.
 Binding A, the Macawg COSE/HTTPS exchange, is normative and implemented.
-Bindings B (OpenID4VCI issuance), C (OpenID4VP) and D (CSC) are proposed, and none is implemented (<<bindings>>, <<recommendation>>).
+Bindings B (OpenID4VCI issuance), C (OpenID4VP), D (CSC) and E (DIDComm Issue Credential) are proposed, and none is implemented (<<bindings>>, <<recommendation>>).
 A BLE transport for binding A, secured with HPKE, lets a device with no network access take part (<<transport-ble>>, <<offline>>). It and store-and-forward (<<store-and-forward>>) are proposed and not implemented.
 ====
 
@@ -55,7 +55,7 @@ It specifies:
 * binding A, the normative exchange: an invite URI, a COSE-signed request, wallet checks, a response, device checks, and HTTPS transport (<<binding-a>>);
 * a proposed BLE transport for binding A, secured with HPKE, rules for offline devices, and proposed store-and-forward sessions (<<transport-ble>>, <<offline>>, <<store-and-forward>>);
 * how the wallet produces the signature in each mode (<<ica>>, <<x509>>);
-* proposed alternative bindings: OpenID4VCI issuance of ICA credentials (<<binding-b>>), OpenID4VP for the device-to-wallet exchange (<<binding-c>>), and CSC remote X.509 signing (<<binding-d>>).
+* proposed alternative bindings: OpenID4VCI issuance of ICA credentials (<<binding-b>>), OpenID4VP for the device-to-wallet exchange (<<binding-c>>), CSC remote X.509 signing (<<binding-d>>), and DIDComm Issue Credential 3.0 between the device and the ICA issuer (<<binding-e>>).
 
 The following are out of scope:
 
@@ -128,6 +128,13 @@ The following are normative only for the proposed bindings B, C and D.
 * [[[RFC9126]]] Lodderstedt, T., et al., _OAuth 2.0 Pushed Authorization Requests_, RFC 9126.
 * [[[CSC-API]]] Cloud Signature Consortium, _Architectures and protocols for remote signature applications_, version 2.0.0.2. https://cloudsignatureconsortium.org/wp-content/uploads/2023/04/csc-api-v2.0.0.2.pdf
 * [[[CSC-DMB]]] Cloud Signature Consortium, _CSC data model bindings_, version 1.0.0. https://cloudsignatureconsortium.org/wp-content/uploads/2025/10/data-model-bindings.pdf
+
+The following are normative only for the proposed binding E. Their statuses differ, and binding E records them (<<e-interop>>).
+
+* [[[DIDCOMM]]] Decentralized Identity Foundation, _DIDComm Messaging_, version 2.1. https://identity.foundation/didcomm-messaging/spec/v2.1/
+* [[[IC3]]] _Issue Credential Protocol 3.0_, status PROPOSED. Protocol page https://didcomm.org/issue-credential/3.0/; text https://github.com/decentralized-identity/waci-didcomm/blob/main/issue_credential/README.md
+* [[[DIDX509]]] Riechert, et al., _did:x509 Decentralized Identifier Method_, draft-birkholz-did-x509-03, Independent Submission, intended status Informational, 30 September 2026. https://www.ietf.org/archive/id/draft-birkholz-did-x509-03.txt. See also the Microsoft did:x509 specification, https://github.com/microsoft/did-x509/blob/main/specification.md
+* [[[ARIES-IC2]]] Hyperledger Aries RFC 0453, _Issue Credential Protocol 2.0_. Informative; used for comparison only. https://github.com/hyperledger/aries-rfcs/blob/main/features/0453-issue-credential-v2/README.md
 
 == Terms and definitions
 
@@ -361,6 +368,7 @@ What a binding must define is its _request representation_, the exact octets tha
 
 |A, COSE/HTTPS |The octets of the decoded envelope `request` member: the UTF-8 JSON exactly as signed. |`macawg.sign_response.v1` |Implemented
 |C, OpenID4VP |The octets of the Request Object, in JWS compact serialization, exactly as received from `request_uri`, before any decoding. |`macawg.sign_response.oid4vp.v1` *(proposed)* |Not implemented
+|E, DIDComm Issue Credential |The request octets inside the proposal attachment, as in binding A. Binding E uses an offer commitment instead of a response proof (<<e-bytes>>). |None |Not implemented
 |===
 
 Binding B is not device-facing.
@@ -388,9 +396,10 @@ These rules apply to every binding:
 |C, OpenID4VP (<<binding-c>>) |Device and wallet |Proposed, evaluation only |Not implemented
 |D, CSC `signHash` remote signing (<<binding-d>>) |Wallet and RSSP |Proposed, ES* and PS* only |Not implemented
 |D, CSC Data Model Bindings profile (<<binding-d-dmb>>) |Device and wallet, over OpenID4VP |Informative evaluation |Not implemented
+|E, DIDComm Issue Credential 3.0 (<<binding-e>>) |Device and ICA issuer, with a separate approval leg to the actor |Proposed |Not implemented
 |===
 
-Bindings compose: a device and wallet use A (or C), and the wallet may use B with its ICA issuer, or D with an RSSP.
+Bindings compose: a device and wallet use A (or C), and the wallet may use B with its ICA issuer, or D with an RSSP. Binding E replaces both legs: the device talks to the ICA issuer directly, and the issuer runs the approval with the actor.
 
 [[binding-a]]
 == Binding A: Macawg COSE/HTTPS
@@ -2325,6 +2334,549 @@ That structure belongs to CSC, so the member needs CSC's agreement, or a Macawg-
 Macawg's response proof addresses exactly that gap.
 <<CSC-DMB>> also says its transaction data types are likely to change (Notes 6, 16 and 18), so a Macawg profile of it should not be normative yet.
 
+[[binding-e]]
+== Binding E: DIDComm Issue Credential 3.0 *(proposed)*
+
+This binding lets a claim generator (the _device_; here typically an authoring app) obtain an ICA credential directly from an ICA issuer over DIDComm Messaging (<<DIDCOMM>>) with the Issue Credential 3.0 protocol (<<IC3>>).
+The issuer, not the device, coordinates the named actor's approval.
+The output is unchanged: the CAWG ICA credential of <<ica>>, verified by content verifiers exactly as <<CAWG-IA>> §8.1.5 describes, without any reference to the DIDComm conversation.
+
+Status: proposed. Not implemented. No standardized CAWG-over-DIDComm protocol exists; this is a Macawg profile. Every `macawg/…` format, message type and problem code in this section is a placeholder in a namespace Macawg would own (<<extension-inventory>>).
+
+[[e-architecture]]
+=== Architecture
+
+Binding E replaces both the device-to-wallet leg (binding A or C) and the wallet-to-issuer leg (binding B) with one DIDComm thread between the device and the issuer, plus a separate approval leg between the actor and the issuer.
+
+[source]
+----
+device (authoring app)            ICA issuer                      actor + wallet
+──────────────────────            ──────────                      ──────────────
+prepare signer_payload,
+reserve space, seal request
+propose-credential ─────────────▶ verify request (C2PA COSE),
+  [proposal attachment]           requester_did = DIDComm from,
+                                  audience, requester policy
+            ◀──────────────────── approval-pending
+                                  [approval URI, expiry]
+show approval URI (QR / link) ────────────────────────────────▶ open URI
+                                  authenticate actor ◀────────── sign in
+                                  show validated request ──────▶ review
+                                  record approval ◀──────────── approve / reject / revise
+            ◀──────────────────── offer-credential
+                                  [offer attachment: exact payload bytes]
+check offer against request
+request-credential ─────────────▶ check offer commitment,
+  [request attachment]            approval, expiry, state
+                                  sign ICA credential (COSE_Sign1)
+            ◀──────────────────── issue-credential
+                                  [credential attachment]
+check credential = offer,
+embed, sign C2PA claim
+ack ────────────────────────────▶ done
+                                                                 content verifier:
+                                                                 CAWG §8.1.5 only
+----
+
+The ordering is a profile choice:
+
+* the device must start with `propose-credential`. <<IC3>> allows three beginnings; this profile allows only the proposal, so the device's signed request is the first thing the issuer sees;
+* `offer-credential` is required, and is sent only after the actor approves, so no identity value reaches the device before disclosure is authorized;
+* `request-credential` may only accept that exact offer.
+
+[[e-roles]]
+=== Roles, keys and trust
+
+Protocol words do not line up with CAWG roles.
+In <<IC3>>, the _Holder_ is whoever receives the credential: here, the device.
+The credential's subject is the named actor, and the ICA credential has no holder binding (<<ica>>).
+The device is not the CAWG named actor, and receiving the credential does not make it one.
+
+[cols="2,3,3,3",options="header"]
+|===
+|Party |Identifiers and keys |Authenticates or signs |Trusted by, and under what policy
+
+|Device: DIDComm holder, C2PA claim generator
+|A DIDComm messaging DID with `keyAgreement` and `authentication` keys; its C2PA signing certificate chain and key
+|Authcrypts its DIDComm messages with the messaging key. Signs the request (COSE, `x5chain`) and, later, the C2PA claim with the C2PA key.
+|The issuer, under its _requester policy_ (<<e-requester>>). Content verifiers, under the C2PA trust list, for the claim.
+
+|Named actor
+|An account at the issuer
+|Authenticates to the issuer, and approves, rejects or revises. Signs nothing.
+|The issuer, under its own authentication policy.
+
+|Wallet
+|The actor's software at the issuer: an app or a browser
+|Carries the actor's authentication. Holds no key in this binding.
+|—
+
+|ICA issuer
+|A `did:web` DID with an `assertionMethod` key (<<CAWG-IA>> §8.1.4.2, §8.1.4.3), and a DIDComm messaging DID, which may be the same DID with a `keyAgreement` key and a `DIDCommMessaging` service
+|Authcrypts offers and credentials. Signs the ICA credential with its `assertionMethod` key. Keeps the approval record.
+|The device, through `audience` and `accepted_issuers`. Content verifiers, through their trusted-ICA list (<<CAWG-IA>> §8.1.5).
+
+|Content verifier
+|—
+|Validates the C2PA claim, and the CAWG ICA credential under <<CAWG-IA>> §8.1.5
+|Its own trust lists for C2PA signers and ICA issuers.
+|===
+
+Three trust decisions are separate, and this binding never treats one as another:
+
+* C2PA claim-signing trust: whether a certificate may sign claims. Content verifiers decide, through the C2PA trust list.
+* ICA issuer trust: whether a DID may attest identities. The device decides through `accepted_issuers`; content verifiers decide through their own list.
+* Requester permission: whether a device may ask this issuer to attest an actor at all. The issuer decides, through its requester policy.
+
+[[e-requester]]
+=== Requester identity and did:x509
+
+The device's certificate-backed identity is proven the way binding A proves it: the request is a `COSE_Sign1` made with the device's C2PA key, carrying the chain in `x5chain` (G1, <<request-auth>>).
+DIDComm authenticates a different key: the device's messaging DID.
+The signed request binds the two:
+
+`requester_did` *(proposed)*::
+The device's DIDComm messaging DID, without fragment. It MUST equal the `from` of every DIDComm message the device sends in the thread.
+
+`audience` *(proposed)*::
+The issuer's DID, without fragment. It MUST equal the DID of the issuer that receives the proposal.
+
+Both members are under the C2PA signature, and MUST be listed in `crit`.
+Their meaning: the holder of this C2PA certificate asks this issuer, through this messaging DID, for this `signer_payload`, until `expires_at`.
+This binding is not standardized anywhere; it is new semantics.
+`session_url` and `session_key` MUST be absent.
+
+Why not use did:x509 as the DIDComm DID::
+DIDComm authcrypt needs the sender's `keyAgreement` key, which the recipient finds by resolving the sender's DID (<<DIDCOMM>>).
+A did:x509 DID document has `keyAgreement` only if the leaf certificate's key usage allows key agreement (<<DIDX509>> §4), and C2PA signing certificates normally do not.
+Resolution also needs the chain (<<DIDX509>> §2.6, §7), which DIDComm does not carry before decryption.
+A signing-only key MUST NOT be used for key agreement.
+So the device uses a separately provisioned messaging DID, bound by `requester_did`.
+
+did:x509 as requester policy::
+The issuer MAY express its requester policy as a list of did:x509 identifiers, such as a CA fingerprint plus a `subject` predicate naming an organization.
+To check a request, the issuer resolves each policy DID with the request's `x5chain` as the `x509chain` resolution option (<<DIDX509>> §7), at the current time, with the revocation checks its policy requires, and requires the leaf key to be the key that verified the request's COSE signature.
+Successful resolution shows that the chain matches the predicates.
+It does not, by itself, authorize anything (<<DIDX509>> §3); the policy entry does.
+did:x509 requires at least two certificates in the chain (<<DIDX509>> §7), so a request whose `x5chain` holds only the leaf fails this check.
+
+ICA issuer::
+This binding uses `did:web` issuers. A did:x509 ICA issuer is not supported in this version (<<e-interop>>).
+
+Actor evidence::
+A certificate presented as evidence of the actor's identity is the issuer's evidence policy, and is out of scope.
+The device's certificate MUST NOT be taken as evidence of the actor's identity.
+
+[[e-messages]]
+=== Messages and attachments
+
+All messages use the DIDComm v2 plaintext structure inside an authcrypt envelope (<<DIDCOMM>>): `from` is REQUIRED, every message in the exchange carries `thid` set to the proposal's `id`, and each message sets `expires_time` no later than the request's acceptance deadline.
+Type URIs use the protocol version, `https://didcomm.org/issue-credential/3.0/<message>`, not the `%VER` placeholder of the <<IC3>> text.
+`body.goal_code` is `macawg.cawg-identity-attestation` *(proposed)*; `credential_preview` is not used, because app-supplied values are not evidence.
+Each message carries exactly one Macawg attachment, with `data.base64` (base64url, <<DIDCOMM>>) holding the exact octets; `data.json` and `data.links` MUST NOT be used, so that the octets that are hashed survive transport.
+
+[cols="2,3,2,3",options="header"]
+|===
+|Message |Attachment `format` *(proposed)* |`media_type` |Content
+
+|`propose-credential` |`macawg/cawg-ica-proposal@v1` |`application/json` |The request envelope of binding A: `{"request": ..., "cose_sign1": ...}`, compact form
+|`offer-credential` |`macawg/cawg-ica-offer@v1` |`application/json` |The offer object (<<e-offer>>), compact form
+|`request-credential` |`macawg/cawg-ica-request@v1` |`application/json` |`{"offer_id": ..., "offer_commitment": ...}`, compact form
+|`issue-credential` |`macawg/cawg-ica-credential@v1` |`application/cose; cose-type="cose-sign1"` (<<RFC9052>> §2, §11.3.1) |The tagged `COSE_Sign1` of the ICA credential
+|===
+
+The issuer tells the device that approval is pending with a child-thread message *(proposed)*:
+`https://macawg.example/approval/1.0/approval-pending`, with `pthid` set to the Issue Credential thread and a body `{"approval_uri": ..., "expires_time": ...}`.
+<<IC3>> has no message for this, and the approval leg is deliberately not part of Issue Credential.
+
+[[e-offer]]
+==== The offer object
+
+[cols="2,1,4",options="header"]
+|===
+|Member |Presence |Meaning
+|`offer_id` |REQUIRED |16 to 64 base64url characters, chosen by the issuer, unique per offer.
+|`request_digest` |REQUIRED |base64url SHA-256 of the request octets from the proposal (<<proof-domains>>).
+|`issuer` |REQUIRED |The issuer's DID. MUST equal the request's `audience`.
+|`credential_payload` |REQUIRED |base64url of the exact JSON octets that will be the ICA credential's `COSE_Sign1` payload, including `validFrom` and any `validUntil`.
+|`expires_at` |REQUIRED |Timestamp after which the issuer will not issue against this offer. No later than the request's acceptance deadline.
+|===
+
+Carrying the exact payload octets removes any question about which parts of the issued credential the device compares: all of them.
+The issuer fixes `validFrom` when it makes the offer, and MUST issue only while `validFrom` is not in the future and the offer has not expired.
+Identifiers, status entries and other issuer-generated members are excluded by the Macawg credential profile anyway (<<ica-properties>>).
+
+[[e-bytes]]
+=== Bytes, digests and parsing
+
+* All Macawg JSON is in compact form (<<resource-limits>>), UTF-8 without a byte-order mark.
+* Receivers MUST reject JSON with duplicate member names, trailing data after the value, or a member not defined for the object.
+* `request_digest` = SHA-256(request octets), as in binding A (<<proof-domains>>).
+* `offer_commitment` = SHA-256(`"macawg.cawg-ica-offer.v1"` ‖ 0x00 ‖ offer octets), base64url. The prefix separates this digest from `request_digest` and from the `c2paAsset` hashes, which are hashes of C2PA assertions.
+* The issued `COSE_Sign1` payload MUST be byte-identical to the decoded `credential_payload`.
+* DIDs are compared as exact strings, without fragment.
+* The COSE algorithm and headers follow <<ica-cose>> and <<ica-cose-profile>>. DIDComm algorithms follow <<DIDCOMM>>: authcrypt with ECDH-1PU+A256KW and A256CBC-HS512.
+
+No response proof is used in this binding.
+The issued credential arrives on the authenticated thread, and its payload is fixed by an offer that commits to `request_digest`; the issuer issues only against an approval for that digest.
+That gives the device G10's guarantee, but not in a form a third party can verify: authcrypt is repudiable.
+
+[[e-validation]]
+=== Validation steps
+
+Issuer, on `propose-credential`::
+. The envelope is authcrypt, and its sender key is in the `keyAgreement` of `from` (<<DIDCOMM>>).
+. The attachment has the proposal format and `data.base64`, and is within the request envelope maximum.
+. The request passes wallet checks 1 to 5, 8 to 14 and 17 to 21 of <<wallet-validation>>, with the absolute time checks of <<acceptance-deadline>>. Checks 6 and 7 compare with an invite, which binding E does not have; the uniqueness check below replaces them. `signer_payload.sig_type` is `cawg.identity_claims_aggregation`.
+. `requester_did` equals `from`; `audience` equals the issuer's DID; both are in `crit`.
+. The certificate satisfies the requester policy (<<e-requester>>).
+. If `accepted_issuers` is non-empty, it contains the issuer's DID.
+. `session_id` and `nonce` have not been seen before from this requester.
+
+On any failure the issuer sends a problem report and involves no actor.
+
+Device, on `offer-credential`::
+. The envelope is authcrypt from the issuer's messaging DID, on the thread.
+. `request_digest` equals the digest of the request it sent; `issuer` equals `audience` and is accepted.
+. The decoded `credential_payload` passes the credential checks of <<device-ica>> that apply to an unsigned payload: properties, structural values, `c2paAsset` equal to `signer_payload`, and identities that answer `requested`.
+. `expires_at` has not passed, and a credential with this payload would fit `max_signature_size`.
+
+Issuer, on `request-credential`::
+. `offer_id` names the offer on this thread, `offer_commitment` matches it, and the offer has not expired.
+. The approval for this thread is still valid.
+. The session state allows issuance (<<e-states>>).
+
+Device, on `issue-credential`::
+. The attachment is a tagged `COSE_Sign1` whose payload equals the offer's `credential_payload`.
+. It passes every check of <<device-ica>>, with the issuer key resolved from the `did:web` document.
+. It fits `max_signature_size`.
+
+[[e-approval]]
+=== Approval
+
+When the proposal is valid, the issuer creates an approval handle with at least 128 bits of entropy, and sends `approval-pending` with an HTTPS `approval_uri` that contains it.
+The device shows the URI to the actor, as a QR code or link.
+The proposal names no person: the actor claims the session by opening the URI and authenticating to the issuer.
+An app that only names someone cannot cause a disclosure or an issuance.
+
+At the URI, the issuer:
+
+. authenticates the actor in this transaction;
+. shows the validated request: the requester's certificate subject and the requester-policy entry it matched, the roles in `signer_payload.role`, the requested identity types and fields, and `context`, labelled as the requester's description. A thumbnail is shown, not checked: the issuer has verified the request's signature and structure, not that the thumbnail depicts the hashed content (<<hashes-not-content>>);
+. shows the identity values it holds for this actor that answer the request, and that they will be published in the asset;
+. lets the actor approve, reject, or revise by deselecting optional identities;
+. on approval, writes the approval record, then sends the offer. On rejection, sends a problem report that contains no identity data.
+
+The approval record is private issuer state, not portable evidence:
+
+[source,json]
+----
+{
+  "approval_id": "<issuer-chosen, 16-64 base64url characters>",
+  "thid": "<Issue Credential thread id>",
+  "actor": "<issuer-internal account reference>",
+  "requester_did": "<DIDComm DID of the device>",
+  "requester_certificate": "<base64url SHA-256 of the leaf certificate>",
+  "audience": "<issuer DID>",
+  "request_digest": "<base64url SHA-256 of the request octets>",
+  "selected_identities": ["<issuer-internal identity references>"],
+  "authenticated_at": "<timestamp>",
+  "approved_at": "<timestamp>",
+  "expires_at": "<no later than the request's acceptance deadline>",
+  "offer_id": "<set when the offer is made>",
+  "offer_commitment": "<set when the offer is made>"
+}
+----
+
+The record shows only what the issuer's authentication supplied.
+It does not imply user presence, biometrics or a portable signature unless the issuer's authentication method actually provided one.
+Its internal references MUST NOT appear in any message, so they never become public identifiers.
+An approval cannot be moved: it names the requester, the issuer, the actor, the thread and the request digest, and the issuer checks all of them before issuing.
+
+[[e-states]]
+=== State machine
+
+Issuer, per thread; every transition is one atomic, durable write:
+
+[cols="2,3,2",options="header"]
+|===
+|State |Event |Next state
+|_proposal-received_ |Proposal valid; `approval-pending` sent |_awaiting-approval_
+|_proposal-received_ |Proposal invalid |_closed_ (problem report)
+|_awaiting-approval_ |Actor approves; record written; offer sent |_offer-sent_
+|_awaiting-approval_ |Actor rejects |_rejected_ (problem report, no data)
+|_awaiting-approval_, _offer-sent_ |Request or offer deadline passes |_expired_
+|_offer-sent_ |Valid `request-credential`; credential signed and stored |_issued_
+|_issued_ |Same `offer_id` and `offer_commitment` again |_issued_: re-send the stored credential bytes, sign nothing new
+|_issued_ |`ack` received, or retention period ends |_done_
+|===
+
+* A new or different `request-credential` in any other state gets a problem report.
+* The device cannot change an approved request. To change anything, it sends a new proposal on a new thread, which needs a new approval. If the actor revises the selection, the offer reflects the revision, and the device may accept it or abandon the thread.
+* <<IC3>> resets both sides on any error and defines no re-send of `issue-credential`. This profile adds the idempotent re-send above, and keeps the issued bytes until the device acknowledges them or the offer expires plus a retention period.
+
+Device, per thread: _proposal-sent_ → _awaiting-approval_ → _offer-received_ → _request-sent_ → _credential-received_ → _done_ (after `ack`), with _abandoned_ on a problem report or expiry. A device that times out in _request-sent_ resends the same `request-credential` until the offer expires.
+
+[[e-errors]]
+=== Problem reports
+
+Problem reports use DIDComm report-problem 2.0, with `pthid` set to the thread (<<DIDCOMM>>), and these codes *(proposed)*:
+
+[cols="3,4",options="header"]
+|===
+|Code |Meaning
+|`e.p.macawg.rejected` |The actor rejected. Carries no identity data.
+|`e.p.macawg.unsupported-format` |Unknown attachment format, media type or data encoding.
+|`e.p.macawg.unsupported-did-method` |A DID the receiver cannot resolve.
+|`e.p.macawg.expired` |The request, approval or offer has expired.
+|`e.p.macawg.changed-content` |A `request-credential` that does not match the offer.
+|`e.p.trust.macawg.untrusted-requester` |The requester policy, `requester_did` or `audience` check failed.
+|`e.p.macawg.evidence-unavailable` |The issuer cannot verify an identity it would need.
+|`e.p.macawg.signature-failed` |The request's COSE signature or chain failed.
+|`e.p.macawg.interrupted` |Issuance was interrupted; the device may resend the same `request-credential`.
+|===
+
+[[e-examples]]
+=== Examples
+
+These examples are illustrative: values in angle brackets are placeholders, and attachment `base64` values are abbreviated.
+They are not test vectors (<<impl-tasks>>).
+
+`propose-credential`:
+
+[source,json]
+----
+{
+  "id": "<uuid-1>",
+  "type": "https://didcomm.org/issue-credential/3.0/propose-credential",
+  "from": "<device messaging DID>",
+  "to": ["did:web:ica.example"],
+  "thid": "<uuid-1>",
+  "created_time": 1792040000,
+  "expires_time": 1792040600,
+  "body": { "goal_code": "macawg.cawg-identity-attestation" },
+  "attachments": [
+    {
+      "id": "proposal",
+      "media_type": "application/json",
+      "format": "macawg/cawg-ica-proposal@v1",
+      "data": { "base64": "<base64url of the request envelope>" }
+    }
+  ]
+}
+----
+
+The signed request inside it is a binding A request with these changes: `requester_did` and `audience` added and listed in `crit`, and no `session_url` or `session_key`:
+
+[source,json]
+----
+{
+  "requester_did": "<device messaging DID>",
+  "audience": "did:web:ica.example",
+  "crit": ["requester_did", "audience"]
+}
+----
+
+`approval-pending`:
+
+[source,json]
+----
+{
+  "id": "<uuid-2>",
+  "type": "https://macawg.example/approval/1.0/approval-pending",
+  "from": "did:web:ica.example",
+  "to": ["<device messaging DID>"],
+  "pthid": "<uuid-1>",
+  "body": {
+    "approval_uri": "https://ica.example/approve/<approval handle>",
+    "expires_time": 1792040600
+  }
+}
+----
+
+`offer-credential`, and its decoded offer object:
+
+[source,json]
+----
+{
+  "id": "<uuid-3>",
+  "type": "https://didcomm.org/issue-credential/3.0/offer-credential",
+  "from": "did:web:ica.example",
+  "to": ["<device messaging DID>"],
+  "thid": "<uuid-1>",
+  "body": { "goal_code": "macawg.cawg-identity-attestation" },
+  "attachments": [
+    {
+      "id": "offer",
+      "media_type": "application/json",
+      "format": "macawg/cawg-ica-offer@v1",
+      "data": { "base64": "<base64url of the offer object>" }
+    }
+  ]
+}
+----
+
+[source,json]
+----
+{
+  "offer_id": "<16-64 base64url characters>",
+  "request_digest": "<base64url SHA-256 of the request octets>",
+  "issuer": "did:web:ica.example",
+  "credential_payload": "<base64url of the exact credential JSON octets>",
+  "expires_at": "<timestamp>"
+}
+----
+
+`request-credential`, and `issue-credential`:
+
+[source,json]
+----
+{
+  "id": "<uuid-4>",
+  "type": "https://didcomm.org/issue-credential/3.0/request-credential",
+  "from": "<device messaging DID>",
+  "to": ["did:web:ica.example"],
+  "thid": "<uuid-1>",
+  "body": {},
+  "attachments": [
+    {
+      "id": "request",
+      "media_type": "application/json",
+      "format": "macawg/cawg-ica-request@v1",
+      "data": { "base64": "<base64url of {offer_id, offer_commitment}>" }
+    }
+  ]
+}
+----
+
+[source,json]
+----
+{
+  "id": "<uuid-5>",
+  "type": "https://didcomm.org/issue-credential/3.0/issue-credential",
+  "from": "did:web:ica.example",
+  "to": ["<device messaging DID>"],
+  "thid": "<uuid-1>",
+  "please_ack": ["<uuid-5>"],
+  "body": {},
+  "attachments": [
+    {
+      "id": "credential",
+      "media_type": "application/cose; cose-type=\"cose-sign1\"",
+      "format": "macawg/cawg-ica-credential@v1",
+      "data": { "base64": "<base64url of the tagged COSE_Sign1>" }
+    }
+  ]
+}
+----
+
+[[e-mapping]]
+=== Requirements mapping
+
+[cols="3,2,4",options="header"]
+|===
+|Requirement |Classification |Mechanism
+
+|Transport, confidentiality, sender authentication |Existing standard |DIDComm authcrypt (<<DIDCOMM>>)
+|Message sequence |Existing standard, profile constraint |<<IC3>>; must start with a proposal; the offer is required
+|Message type URIs |Profile constraint |`issue-credential/3.0/…` in place of `%VER`
+|Attachment `format`, not a body `formats` list |Profile constraint |<<IC3>>'s 3.0 change aligns attachments with DIDComm v2; its 2.0 change-log text about a `formats` field does not apply
+|Acknowledgement |Existing standard |DIDComm `please_ack` and `ack` headers, in place of the DIDComm v1 `~please-ack` decorator that the <<IC3>> text still uses
+|Proposal, offer, request and credential contents |New attachment |Four `macawg/…` formats (<<e-messages>>)
+|Certificate-backed requester |Existing (Macawg G1) |C2PA `COSE_Sign1` with `x5chain`
+|Binding the C2PA certificate to the messaging DID and the issuer |New semantic extension |`requester_did`, `audience` (<<e-requester>>)
+|Requester permission |New semantic extension |Requester policy, optionally did:x509 identifiers (<<DIDX509>> §7)
+|Actor approval |New semantic extension |Approval leg and `approval-pending` (<<e-approval>>)
+|Approval binding |New semantic extension |Private approval record
+|Offer commitment and exact payload |New attachment, byte rules |<<e-offer>>, <<e-bytes>>
+|Idempotent re-issue |Profile constraint |<<e-states>>; <<IC3>> defines no re-send
+|Errors |Existing structure, new codes |report-problem 2.0 (<<DIDCOMM>>), codes in <<e-errors>>
+|Expiry |Existing standard and profile |`expires_time` (<<DIDCOMM>>), request deadline, offer `expires_at`
+|ICA credential |Existing standard |<<CAWG-IA>> §8.1, with the Macawg profile (<<ica-cose-profile>>)
+|Content verification |Existing standard |<<CAWG-IA>> §8.1.5, independent of DIDComm
+|did:x509 ICA issuer |Unresolved implementation limitation |<<e-interop>>
+|Requester is the final claim signer |Unresolved |No CAWG mechanism (<<CAWG-IA>> §9.4.7); <<claim-generator-substitution>>
+|Delivery to a device without a DIDComm endpoint |Unresolved implementation limitation |<<e-decisions>>
+|===
+
+[[e-interop]]
+=== Interoperability assessment
+
+Issue Credential 3.0::
+Status PROPOSED in its specification text, and "Draft" on its protocol page (<<IC3>>). The text has inconsistencies that this profile resolves rather than copies: `%VER` placeholders in type URIs; a change log describing a body `formats` field that the 3.0 examples do not use; an offer section whose format table is headed "Request Attachment Registry"; and DIDComm v1 decorators and Aries ack and problem-report references in a DIDComm v2 protocol. Library support for 3.0 was not verified for this draft.
+
+Aries Issue Credential 2.0::
+Used for comparison only. It is ADOPTED, uses DIDComm v1 structures (`@type`, `~attach`, a body `formats` array), and also resets on errors without a re-send (<<ARIES-IC2>>). Its wire format MUST NOT be mixed with this profile.
+
+DIDComm Messaging 2.1::
+The specification page is labelled "Working Group Approved" while its title block reads "Editor's Draft" (<<DIDCOMM>>). Authcrypt with X25519, P-384 and P-256 key agreement is required. DIDComm 2.1 defines no return-route mechanism, so a device without a reachable endpoint needs a mediator or another delivery arrangement.
+
+COSE credential::
+Unchanged from <<ica>>. <<CAWG-IA>> 1.3 allows the C2PA algorithms (§8.1.5.2.1); the Macawg profile and current c2pa-rs validators use Ed25519.
+
+DID methods and verification methods::
+`did:web` is the method <<CAWG-IA>> §8.1.4.2 recommends consumers support, and its documents can use `JsonWebKey2020` (§8.1.4.3).
+A did:x509 ICA issuer is not supported in this version, for three reasons:
+* a content verifier must resolve the issuer DID (<<CAWG-IA>> §8.1.5.2.3), and did:x509 resolution needs the chain (<<DIDX509>> §2.6). The chain can travel in the credential's `x5chain` COSE header (<<RFC9360>>, <<DIDX509>> §1.1), which <<CAWG-IA>> does not forbid, but the Macawg header profile does, and CAWG validators have no defined way to pass it to a resolver;
+* did:x509 produces a `JsonWebKey` verification method (<<DIDX509>> §4), not the `JsonWebKey2020` that <<CAWG-IA>> recommends and validators check;
+* CA-issued certificates are often ECDSA, which <<CAWG-IA>> allows but the Macawg profile does not.
++
+Resolver implementations exist for the requester-policy use: Microsoft's Python reference resolver and `didx509cpp` (<<DIDX509>> §8).
+
+[[e-acceptance]]
+=== Acceptance cases
+
+[cols="3,5",options="header"]
+|===
+|Case |Expected result
+|Normal flow |Credential issued; payload equals the offer; device embeds it; a content verifier validates it under <<CAWG-IA>> §8.1.5 alone.
+|Altered payload: the device's request differs from the approved one, or the `credential_payload` is altered |Issuer: `changed-content` or `signature-failed`. Device: rejects an offer whose `request_digest` differs, or a credential whose payload differs from the offer.
+|Wrong subject: an approval by one actor used for another thread or request |Issuer refuses: the record names the thread and request digest.
+|Wrong issuer: offer or credential from a DID other than `audience` |Device rejects.
+|Stale approval: `request-credential` after the approval or offer expires |`expired`; nothing issued.
+|Replay: an old proposal's `session_id` and `nonce`, or an old `request-credential` on a new thread |Issuer rejects; the offer belongs to one thread.
+|Duplicate `request-credential` after issuance |The same credential bytes again; nothing new signed.
+|Unsupported resolver: requester policy needs did:x509 and the issuer cannot resolve it; or the device cannot resolve the issuer's DID |`untrusted-requester`, or `unsupported-did-method`.
+|Missing chain: `x5chain` holds only the leaf |did:x509 policy check fails (two certificates required); `untrusted-requester`.
+|`requester_did` differs from DIDComm `from`, or `audience` differs from the issuer |`untrusted-requester`.
+|Malformed response: `data.json` instead of `base64`, duplicate JSON members, trailing data, untagged COSE, wrong media type |Rejected; `unsupported-format`.
+|Actor rejects |`rejected` with no identity data; the device learns nothing else.
+|Final-signer mismatch |Not tested: this binding does not claim the requester signs the final claim.
+|===
+
+[[e-decisions]]
+=== Remaining decisions
+
+[cols="3,2,4",options="header"]
+|===
+|Decision |Recommended default |Consequence
+|How approval-pending is signalled |A Macawg child-thread message |Needs a Macawg-owned message type; Issue Credential stays unmodified.
+|Approval record |Private issuer state |Simple, and leaks nothing; but no third party can audit an approval. A portable, issuer-signed record would need its own format and privacy review.
+|Offer content |Exact payload octets |Removes all comparison ambiguity; `validFrom` is fixed when the offer is made.
+|ICA issuer DID method |`did:web` only |Works with CAWG validators today; did:x509 issuers wait for CAWG validator support.
+|Requester policy |did:x509 identifiers over the C2PA chain |Pins a CA and subject rather than a leaf, so it survives certificate renewal and key rotation; pinning a leaf breaks at each renewal, and pinning a key at each rotation.
+|Credential media type |`application/cose; cose-type="cose-sign1"` |Registered in <<RFC9052>>; `application/vc+cose` was not checked for this draft.
+|Response proof |Not used |G10 holds for the device only; a third party cannot verify the request-to-result link.
+|Device reachability |A DIDComm mediator for devices without an endpoint |Adds a mediator dependency; a device with an endpoint needs none.
+|Acknowledgement |`please_ack` on `issue-credential` |Lets the issuer release stored bytes; without it, the issuer keeps them until the offer expires plus retention.
+|===
+
+[[e-conclusion]]
+=== Conclusion
+
+Binding E can be implemented as a profile that uses the existing CAWG ICA output unchanged.
+The minimum additions are:
+
+. four attachment formats (<<e-messages>>);
+. the signed request members `requester_did` and `audience` (<<e-requester>>);
+. the approval leg, the `approval-pending` message and the private approval record (<<e-approval>>);
+. profile rules on Issue Credential 3.0: proposal first, required offer, offer commitment, idempotent re-issue, DIDComm v2 headers, problem codes (<<e-states>>, <<e-errors>>);
+. a requester policy, optionally expressed as did:x509 identifiers.
+
+It stays proposed while Issue Credential 3.0 is a draft with unverified library support, and while device reachability without an endpoint needs a mediator.
+
+Direct X.509 signing (`cawg.x509.cose`) is the alternative when the actor holds a certificate: the actor signs, no issuer is involved, and this binding is not needed. Its DIDComm or OpenID4VP carriage is not specified here (<<binding-d>>).
+
 == Security considerations
 
 === Bindings
@@ -2789,6 +3341,12 @@ The last column says whether binding A's wire representation stays unchanged if 
 |Over BLE, the wallet no longer compares the device's timestamps with its own clock.
 |Yes; the rule changes only for BLE
 
+|Device-to-issuer issuance over DIDComm
+|DIDComm authcrypt, <<DIDCOMM>>; Issue Credential 3.0 messages, <<IC3>>
+|Profile, new attachments and new semantics (<<e-mapping>>)
+|The issuer, not the wallet, runs the approval; the actor approves at the issuer.
+|Proposal reuses the binding A request, with `requester_did` and `audience` added
+
 |Store-and-forward
 |None. OpenID4VCI deferred issuance, <<OpenID4VCI>> §9, is an issuer-to-wallet analogue only
 |None
@@ -2821,6 +3379,12 @@ The `macawg_` names are placeholders: the namespace (a CAWG-registered URI, or a
 |`macawg_cawg_sign` |Transaction data type, with members `signer_payload`, `max_signature_size`, `requested`, `context` |OpenID4VP `transaction_data` |Proposed
 |`{ "signature", "response_proof" }` |Presentation structure for `macawg_ica_cose` |OpenID4VP `vp_token` |Proposed
 |`cawg` |Member of CSC `x509PresentationResponse` |OpenID4VP with <<CSC-DMB>> |Proposed; needs CSC agreement
+|`macawg/cawg-ica-proposal@v1`, `macawg/cawg-ica-offer@v1`, `macawg/cawg-ica-request@v1`, `macawg/cawg-ica-credential@v1` |DIDComm attachment formats |Binding E |Proposed
+|`requester_did`, `audience` |Request members |Binding E |Proposed
+|`https://macawg.example/approval/1.0/approval-pending` |DIDComm message type (placeholder URI) |Binding E |Proposed
+|`macawg.cawg-identity-attestation` |`goal_code` |Binding E |Proposed
+|`e.p.macawg.*`, `e.p.trust.macawg.untrusted-requester` |Problem-report codes |Binding E |Proposed
+|`macawg.cawg-ica-offer.v1` |Offer-commitment hash prefix |Binding E |Proposed
 |`k` |Invite parameter |BLE transport |Proposed
 |`session_key` |Request member |BLE transport |Proposed
 |`store_and_forward`, with `lifetime` |Request member |BLE store-and-forward |Proposed
@@ -2858,6 +3422,10 @@ Proposed, lower priority::
 Store-and-forward, for when neither side is online at the scan.
 It keeps keys and requests for days, and needs persistence on the device, so it should follow the BLE transport, not precede it.
 
+Proposed::
+Binding E, DIDComm Issue Credential 3.0 between the device and the ICA issuer.
+It uses the CAWG ICA output unchanged, but rests on a protocol that is still a draft, needs four new attachment formats and an approval leg, and needs a mediator for devices without a DIDComm endpoint (<<e-conclusion>>).
+
 Evaluation only::
 Binding C (OpenID4VP) and the CSC Data Model Bindings profile.
 They need a new transaction data type, a new format or response member, a namespace decision, and review by the OpenID and CSC communities.
@@ -2890,7 +3458,11 @@ Delivery and failure: the first and the last fragment of a REQUEST lost or delay
 Offline validity: a device without trusted current time records "temporal validity unchecked" without a proof, "issuer-attested validity during the session" with one, and never "full acceptance"; an expired credential delivered with a proof made while it was valid is recorded at the second level, not the first.
 . *Store-and-forward.*
 Persistent device state, a resumption after a power cycle, a `session_unusable` rejection, and a duplicate RESPONSE after the session finished.
-. *Namespace.* Decide who owns the `macawg_` identifiers, and register or rename them.
+. *Binding E.*
+An issuer that accepts proposals, runs the approval leg and issues against offers; a device that proposes, checks offers and credentials, and acknowledges.
+Vectors: a proposal attachment for the binding A example request with `requester_did` and `audience`; an offer object and its `offer_commitment`; the `request-credential` attachment; the issued `COSE_Sign1` and its payload equality with the offer.
+Rejection cases: those in <<e-acceptance>>.
+. *Namespace.* Decide who owns the `macawg_` and `macawg/` identifiers, and register or rename them.
 
 [appendix]
 == Implementation status (informative)
@@ -2963,6 +3535,7 @@ A helper being available does not mean that a given wallet or device calls it.
 |Idempotent outcome for a retried response |Application |The device's session store
 |Binding B `macawg_ica_dataset` type, `locations`, `macawg_not_after` |Not implemented |—
 |Store-and-forward |Not implemented |—
+|Binding E (DIDComm Issue Credential 3.0) |Not implemented |—
 |Proof AAD `macawg.sign_response.oid4vp.v1` |Not implemented |—; `tests/vectors.rs` checks that a proof made with it does not verify under binding A
 |Binding A test vectors (<<impl-tasks>> item 1) |Library |`tests/vectors.rs`
 |===
@@ -3001,6 +3574,10 @@ Redirect handling belongs to the application's HTTP client.
 [appendix]
 [[changelog]]
 == Change log (informative)
+
+0.14-draft::
+* Added binding E, a proposed profile of DIDComm Issue Credential 3.0 between the device and the ICA issuer, with a separate approval leg (<<binding-e>>). It defines four attachment formats, the `requester_did` and `audience` request members, an `approval-pending` message, a private approval record, exact byte rules and an offer commitment, a state machine with idempotent re-issue, problem codes, examples, a requirements mapping, an interoperability assessment, acceptance cases and remaining decisions.
+* did:x509 is used for requester policy only; ICA issuers use `did:web`.
 
 0.13-draft::
 * Named the residual risk that any holder of the session URL can end an HTTPS session with a valid `declined`, and why BLE raises the bar (<<declined-dos>>). Corrected the session-state rationale.
