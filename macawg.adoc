@@ -7,7 +7,7 @@
 :sectanchors:
 :icons: font
 :source-highlighter: rouge
-:revnumber: 0.11-draft
+:revnumber: 0.12-draft
 :revdate: 2026-10-14
 :cawg-ia: https://cawg.io/identity/1.3/
 :c2pa-spec: https://c2pa.org/specifications/specifications/2.2/specs/C2PA_Specification.html
@@ -811,7 +811,7 @@ It is the single deadline for every party, and every time check in this document
 * the wallet does not offer to sign after it (check 8 above);
 * the wallet does not send a `signed` response after it;
 * the device does not accept a response after it (<<device-validation>>);
-* the device discards the session after it (<<session-state>>).
+* the device closes the exchange after it, keeping only what it needs to finalize an accepted signature (<<session-state>>).
 
 A request is _expired_ when the current time is later than its acceptance deadline.
 Because `expires_at` is at most 15 minutes after `issued_at`, the acceptance deadline is at most 20 minutes after `issued_at`.
@@ -1242,16 +1242,34 @@ Otherwise anyone who can reach the session URL could close the session by postin
 The wallet MAY retry until the acceptance deadline.
 The device SHOULD rate-limit submissions per session.
 * A valid `declined` response ends the session.
-* When the device accepts a valid response, signed or declined, it MUST record the outcome and the SHA-256 of the complete sign response, atomically with marking the session finished.
-* _Accepted_ means durably committed. Before it reports acceptance (HTTP 2xx, or a BLE `RESULT` `accepted`), the device MUST have durably stored, in the same atomic commit as the finished record, either the completed asset with the identity assertion, or the `signature` bytes, any `response_proof`, and all the asset and claim state it needs to finish the asset after a restart.
-* The session then has one of three persisted states: _open_; _accepted, awaiting finalization_; and _applied_, once the completed asset is durably stored. After a restart, a device in the second state MUST finish the asset from the stored signature, and MUST NOT ask for or accept a new one.
+* When the device accepts a valid response, signed or declined, it MUST durably commit it, in one atomic write, before it reports acceptance (HTTP 2xx, or a BLE `RESULT` `accepted`). _Accepted_ means durably committed. It means the response was accepted, and that includes a refusal: a `declined` response that is accepted also gets `accepted`.
++
+[cols="1,4",options="header"]
+|===
+|Accepted response |What the atomic commit stores
+|`signed` |The outcome; the SHA-256 of the complete sign response; and either the completed asset with the identity assertion, or the `signature` bytes, any `response_proof`, and all the asset and claim state needed to finish the asset after a restart.
+|`declined` |The outcome and the SHA-256 of the complete sign response. There is no signature and nothing to finalize.
+|===
++
 If power fails before the commit, nothing was accepted, and a retry is processed as a new response.
-The complete sign response is the JSON octets of the response exactly as received: the HTTP request body for HTTPS, or the decrypted RESPONSE plaintext for BLE. Framing, fragmentation and encryption are not part of it, so they may differ between attempts.
+* The session has one of four persisted states:
++
+[cols="2,4",options="header"]
+|===
+|State |Meaning
+|_open_ |No response accepted yet.
+|_accepted, awaiting finalization_ |A `signed` response is committed, but the completed asset is not yet durably stored. After a restart, the device MUST finish the asset from the stored signature, and MUST NOT ask for or accept a new one.
+|_applied_ |The completed asset is durably stored. Terminal.
+|_declined_ |A `declined` response is committed. Terminal.
+|===
+* The _complete sign response_ is the JSON octets of the response exactly as received: the HTTP request body for HTTPS, or the decrypted RESPONSE plaintext for BLE. Framing, fragmentation and encryption are not part of it, so they may differ between attempts.
 * A retry is _identical_ when its sign response octets have the same SHA-256 as the recorded one. The comparison is on the octets, with no parsing or canonicalization.
 The wallet MUST store the octets of its sign response and resend exactly those octets.
-* For an identical retry, the device MUST answer with the recorded outcome (HTTP 2xx, or a BLE `RESULT` `accepted`) and MUST NOT apply the signature again.
+* For an identical retry, signed or declined, the device MUST answer with the recorded outcome (HTTP 2xx, or a BLE `RESULT` `accepted`), and MUST NOT apply a signature again.
 Any other response for a finished session MUST be rejected with the error `already_finished`, even one with the same `signature` and a different `response_proof`.
-* The device MUST keep this finished-session record until the acceptance deadline, and MUST discard the session, including the record, after the deadline (<<acceptance-deadline>>, <<ble-time>>).
+* The device MUST keep the finished-session record until the acceptance deadline.
+* *Expiry.* At the acceptance deadline (<<acceptance-deadline>>, <<ble-time>>), the exchange closes: the device MUST NOT accept any further response, and MAY then delete the transport keys, the request, and the retry record.
+Expiry MUST NOT delete the data needed to finalize an operation already in the _accepted, awaiting finalization_ state. That data is kept until the asset is _applied_, even if the device restarts after the deadline.
 
 [[transport]]
 == Transports for binding A
@@ -1476,7 +1494,7 @@ The nonce has only 128 bits, below the 32 bytes of entropy that HPKE's PSK mode 
 |`Seal(header ‖ challenge, response)` with the wallet-to-device context, where `challenge` is the one in this connection's REQUEST. `response` is the sign response JSON, exactly as an HTTPS `POST` would carry it.
 
 |RESULT |Device to wallet on Request
-|`Seal(header ‖ challenge, result)` with the device-to-wallet context. `result` is `{"result":"accepted"}`, or `{"result":"rejected","error":<code>}`. This plays the part of the HTTPS status code. A retried identical response gets the recorded `accepted` again (<<session-state>>).
+|`Seal(header ‖ challenge, result)` with the device-to-wallet context. `result` is `{"result":"accepted"}`, or `{"result":"rejected","error":<code>}`. This plays the part of the HTTPS status code. `accepted` means the device accepted and committed the response, whether it was `signed` or `declined`. A retried identical response gets the recorded `accepted` again (<<session-state>>).
 
 |ERROR |Either direction
 |One byte of error code, unencrypted (<<ble-errors>>).
@@ -1509,7 +1527,8 @@ A connection carries at most one exchange, in this order, with these HPKE sequen
 |4 |RESULT |Device to wallet |1 (device-to-wallet context)
 |===
 
-* After the RESULT, or after the wallet decides not to send a RESPONSE, both sides close the connection. Any later attempt uses a new connection, a new HELLO and new contexts.
+* The exchange is complete when the wallet has confirmed the last RESULT fragment (<<BT-CORE>> Vol 3, Part F, §3.4.7.3). Queuing the last indication is not enough. The device MUST wait for that confirmation, or for the 30-second ATT transaction timeout (Part F, §3.3.3), before it disconnects. The wallet MUST NOT disconnect before its confirmation of the last fragment has been sent.
+* After that, or after the wallet decides not to send a RESPONSE, both sides close the connection. Any later attempt uses a new connection, a new HELLO and new contexts.
 * Either side MUST abort on a frame that is not the next one in this table: for example a second HELLO, a RESPONSE before the REQUEST, or any frame after the RESULT. `ERROR` may arrive at any point.
 * Reassembly buffers and HPKE contexts belong to one connection, and MUST NOT be shared with or carried into another.
 * After a rejected RESPONSE, the wallet may try again only on a new connection.
@@ -1626,7 +1645,7 @@ The HTTPS transport keeps the absolute checks, because an HTTPS device is reacha
 * `W` MUST be greater than 0 and at most 15 minutes (check 19).
 * The device MUST NOT make the initial delivery of a REQUEST more than `W` after it created the request, measured on its own clock. Retransmissions follow <<ble-resume>>.
 * The wallet's deadline is `t_hello + W + L`, where `t_hello` is the wallet's time when it wrote the HELLO that led to its first REQUEST, and `L` is the store-and-forward lifetime, or 0 (<<store-and-forward>>). Each later connection may only shorten it (<<ble-resume>>). The wallet MUST NOT send a `signed` response after it.
-* The device's deadline is `t_create + 2W + L + 5 minutes`, on its own clock. The device MUST NOT accept a response after it, and MUST discard the session after it.
+* The device's deadline is `t_create + 2W + L + 5 minutes`, on its own clock. The device MUST NOT accept a response after it. Expiry then follows <<session-state>>: transport keys and retry records may be deleted, but not the data needed to finalize an accepted signature.
 * Both the device and the wallet MUST measure elapsed time with a clock that does not jump, such as a monotonic clock, or a real-time clock that is not adjusted during the session.
 * Each side MUST keep accounting for elapsed time across a restart. A side that cannot establish how much time passed while it was not running MUST treat the session as expired.
 A wallet usually has network time and can use it to recover after a restart; a device without trusted time needs a real-time clock that keeps running while it is off.
@@ -1679,9 +1698,9 @@ A device or wallet conforms to it only if it meets every requirement below, as w
 |One accepted response; the recorded outcome for an identical retry; `already_finished` for a different one; nothing ends a session on an unauthenticated `ERROR` (<<session-state>>, <<ble-errors>>).
 |Stores its sign response octets, and resends exactly those after a lost RESULT.
 
-|Persistence (store-and-forward only)
-|The state listed in <<store-and-forward>>, kept across power cycles, with the finished record written atomically.
-|The stored request and approval, protected at rest; no stored `skW`.
+|Persistence (every session)
+|The durable acceptance commit and the four persisted states (<<session-state>>), kept across power cycles. Store-and-forward also keeps the state listed in <<store-and-forward>>.
+|The octets of its sign response, for identical retries. Store-and-forward also keeps the request and approval, protected at rest; never `skW`.
 |===
 
 [[offline]]
@@ -1785,7 +1804,7 @@ The device persists, so that a power cycle does not lose them:
 
 * `sid`, the nonce, and `skD`. The device SHOULD keep `skD` in protected storage, such as a secure element;
 * the request bytes it sent, which it needs for the response proof and for check 6 of <<device-validation>>;
-* `t_create`, and enough clock state to measure elapsed time across a power cycle. A device that cannot measure elapsed time reliably after a restart MUST discard its pending sessions;
+* `t_create`, and enough clock state to measure elapsed time across a power cycle. A device that cannot measure elapsed time reliably after a restart MUST treat its _open_ sessions as expired, but MUST still finalize any session that is _accepted, awaiting finalization_;
 * the asset and its unfinished claim, exactly as they were when it computed the `signer_payload`, including the space reserved for the identity assertion;
 * a _finished_ flag, written atomically with accepting a response, together with the recorded outcome and the SHA-256 of the complete sign response octets (<<session-state>>).
 
@@ -1817,7 +1836,7 @@ A device that no longer holds the session cannot open the HELLO.
 It sends an unauthenticated `ERROR` with code `0x01`.
 The wallet MAY retry until its own deadline, and MUST then delete its stored state.
 
-A device MUST keep `sid`, the nonce, `skD` and the request envelope until its deadline, even after the session finishes or it discards the asset.
+A device MUST keep `sid`, the nonce, `skD` and the request envelope until its deadline, even after the session finishes or it discards the asset. After the deadline it may delete them, subject to the expiry rule in <<session-state>>.
 It needs them to complete the HELLO and REQUEST of a retry, to answer an identical retry with the recorded outcome, and to send a sealed rejection.
 This applies to every BLE session, not only store-and-forward ones.
 
@@ -2832,6 +2851,7 @@ A GATT server on a device and a client in the wallet; framing; HPKE with the fix
 Vectors, made deterministic with HPKE `DeriveKeyPair` from fixed seeds (<<RFC9180>> §7.1.3): `skD`, `pkD`, `skW`, `pkW` and the ephemeral keys; `info_w2d` and `info_d2w` for the example `sid` and nonce; the HELLO, REQUEST, RESPONSE and RESULT frames for the binding A example messages; the same frames fragmented at `ATT_MTU` 23 and 247.
 Rejection cases: a HELLO sealed with the wrong nonce; a `session_key` that differs from `k`; a captured HELLO replayed together with its captured RESPONSE, which must fail at the RESPONSE; a RESPONSE whose AAD carries another connection's `challenge`; a frame whose `length` is too large; a fragment longer than 512 bytes at an `ATT_MTU` of 517; a truncated fragment stream; an unauthenticated `ERROR` that must not end the session; a retransmitted REQUEST that differs from the stored one; an initial-delivery HELLO after `W`; a `remaining` that would extend the wallet's deadline, which must be ignored.
 Lost acknowledgement: an identical RESPONSE after the session finished gets `accepted` again, and is not applied twice; a different one gets `already_finished`.
+State recovery: a `declined` response committed, then a reboot, then an identical retry, which gets `accepted` again and leaves the session _declined_; a `signed` response committed just before the deadline, then power loss, then a restart after the deadline, after which the device finalizes the asset from the stored signature and accepts no new response; a device that disconnects before the last RESULT confirmation, which the wallet must treat as a lost RESULT.
 Delivery and failure: the first and the last fragment of a REQUEST lost or delayed; a RESULT that never arrives, so the RESULT-wait timer fires and the wallet retries; a frame kept open by one fragment every 29 seconds, which the whole-frame timer must end; power failure before, during and after the acceptance commit, each followed by a retry; two wallets connected at once; and unexpected frame sequences, such as a second HELLO, a RESPONSE before the REQUEST, a frame after the RESULT, a HELLO with a reserved flag bit set, and trailing bytes after a frame body.
 Offline validity: a device without trusted current time records "temporal validity unchecked" without a proof, "issuer-attested validity during the session" with one, and never "full acceptance"; an expired credential delivered with a proof made while it was valid is recorded at the second level, not the first.
 . *Store-and-forward.*
@@ -2947,6 +2967,12 @@ Redirect handling belongs to the application's HTTP client.
 [appendix]
 [[changelog]]
 == Change log (informative)
+
+0.12-draft::
+* Durable acceptance now covers `declined` responses, with their own commit contents and a terminal _declined_ state; `RESULT` `accepted` covers a refusal too (<<session-state>>).
+* Expiry closes the exchange, but does not delete what is needed to finalize an accepted signature.
+* The device waits for the confirmation of the last RESULT indication, or the ATT timeout, before it disconnects.
+* The conformance table's persistence row now applies to every session.
 
 0.11-draft::
 * BLE delivery: the device now sends with indications and waits for each confirmation, because notifications can be discarded on buffer overflow (<<BT-CORE>> Vol 3, Part F, §3.3.2). Every fragment is acknowledged; only the unenhanced ATT bearer is used. Asked for throughput measurements.
