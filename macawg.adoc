@@ -7,7 +7,7 @@
 :sectanchors:
 :icons: font
 :source-highlighter: rouge
-:revnumber: 0.9-draft
+:revnumber: 0.10-draft
 :revdate: 2026-10-14
 :cawg-ia: https://cawg.io/identity/1.3/
 :c2pa-spec: https://c2pa.org/specifications/specifications/2.2/specs/C2PA_Specification.html
@@ -310,6 +310,11 @@ The reason `response_proof_unsupported` means the wallet could not produce a req
 
 Every binding MUST provide each of these guarantees.
 A binding that cannot provide one MUST say so, and MUST NOT be described as conforming for that mode.
+
+There is one named exception, _limited validity mode_ (<<offline-validity>>).
+A device without trusted current time cannot establish that a credential is valid when it accepts it, so it does not meet G7's temporal-validity requirement.
+It conforms only in limited validity mode, and only if it records which lower acceptance level it reached.
+Every other guarantee still applies in full.
 The section references give the binding A rules.
 
 [cols="1,3,5,2",options="header"]
@@ -322,11 +327,11 @@ The section references give the binding A rules.
 |G4 |Exact payload |The wallet signs, or has issued, exactly the signer payload in the request. Unknown payload members are rejected, never dropped. |<<wire-signer-payload>>, <<extensions>>
 |G5 |Disclosure control |Only requested types, fields and providers; exactly the values the person approved; no other property, header or entry. The wallet checks before release. |<<selective-disclosure>>, <<wallet-release>>
 |G6 |Informed approval |The person sees the requester, the context as the requester's description, the roles, and the identity values and their publication, and agrees. |<<wallet-validation>>
-|G7 |Issuer acceptance |An ICA credential's issuer is in `accepted_issuers`, or allowed by an independent trust policy, and the credential is valid. |<<device-ica>>
+|G7 |Issuer acceptance |An ICA credential's issuer is in `accepted_issuers`, or allowed by an independent trust policy, and the credential is valid, including at the device's current time when it accepts it ("full acceptance"). In limited validity mode, the temporal part is not met (<<offline-validity>>). |<<device-ica>>, <<offline-validity>>
 |G8 |Size |The signature fits `max_signature_size`. All inputs are within the maximums. |<<resource-limits>>
 |G9 |Exact bytes |The `signature` bytes travel unchanged from the signer to the identity assertion. Nobody repairs or rewrites them. |<<_use_of_the_signature>>
 |G10 |Request-to-result proof |When required, the key that made the identity signature also signs a digest of the exact request and a digest of the exact signature bytes. For ICA, the issuer signs only under current actor authorization. |<<response-proof>>
-|G11 |Deadline |Every party acts only before the session's acceptance deadline, as the device measures it. Over HTTPS all parties use the same absolute deadline. Over BLE, and at the issuer, each party uses a deadline derived so that it is never later than the device's. |<<acceptance-deadline>>, <<ble-time>>, <<vci-dataset>>
+|G11 |Deadline |Each party enforces its own specified deadline, and the device's is authoritative: the device accepts nothing after its deadline, on its own clock. Over HTTPS every party uses the same absolute deadline on its own clock, so a wallet whose clock is behind may act after the device's deadline, and the device then rejects. Over BLE, the wallet's and the issuer's deadlines are derived to be no later than the device's, provided the clock-rate and restart assumptions of <<ble-time>> hold. |<<acceptance-deadline>>, <<ble-time>>, <<vci-dataset>>
 |G12 |Fail-closed extensions |A receiver that does not implement a security-relevant requirement rejects the request; it does not ignore the requirement. |<<extensions>>
 |===
 
@@ -1452,16 +1457,16 @@ The nonce has only 128 bits, below the 32 bytes of entropy that HPKE's PSK mode 
 |Frame |Direction |`body`
 
 |HELLO |Wallet to device on Key exchange
-|`sid_len` (1 byte), `sid` (ASCII), `enc_w` (32 bytes), and `Seal(aad, pkW ‖ flags)` (49 bytes). The wallet generates a fresh key pair `(skW, pkW)` for each connection, and runs `SetupBaseS(pkD, info_w2d)` to get `enc_w` and its context. `flags` is one byte; bit 0, _resume_, is set when the wallet already holds the request (<<ble-resume>>).
+|`sid_len` (1 byte), `sid` (ASCII), `enc_w` (32 bytes), and `Seal(header, pkW ‖ flags)` (49 bytes). The wallet generates a fresh key pair `(skW, pkW)` for each connection, and runs `SetupBaseS(pkD, info_w2d)` to get `enc_w` and its context. `flags` is one byte; bit 0, _resume_, is set when the wallet already holds the request (<<ble-resume>>).
 
 |REQUEST |Device to wallet on Request
-|`enc_d` (32 bytes) and `Seal(aad, challenge ‖ remaining ‖ envelope)`. The device opens the HELLO with `SetupBaseR(enc_w, skD, info_w2d)`, then runs `SetupBaseS(pkW, info_d2w)`. `challenge` is 32 bytes from a cryptographically secure random generator, new for every connection (<<ble-replay>>). `remaining` is 4 bytes, big-endian: the whole seconds left until the device's deadline (<<ble-time>>). `envelope` is the request envelope JSON, exactly as an HTTPS `GET` would return it.
+|`enc_d` (32 bytes) and `Seal(header, challenge ‖ remaining ‖ envelope)`. The device opens the HELLO with `SetupBaseR(enc_w, skD, info_w2d)`, then runs `SetupBaseS(pkW, info_d2w)`. `challenge` is 32 bytes from a cryptographically secure random generator, new for every connection (<<ble-replay>>). `remaining` is 4 bytes, big-endian: the whole seconds left until the device's deadline (<<ble-time>>). `envelope` is the request envelope JSON, exactly as an HTTPS `GET` would return it.
 
 |RESPONSE |Wallet to device on Response
-|`Seal(aad ‖ challenge, response)` with the wallet-to-device context, where `challenge` is the one in this connection's REQUEST. `response` is the sign response JSON, exactly as an HTTPS `POST` would carry it.
+|`Seal(header ‖ challenge, response)` with the wallet-to-device context, where `challenge` is the one in this connection's REQUEST. `response` is the sign response JSON, exactly as an HTTPS `POST` would carry it.
 
 |RESULT |Device to wallet on Request
-|`Seal(aad ‖ challenge, result)` with the device-to-wallet context. `result` is `{"result":"accepted"}`, or `{"result":"rejected","error":<code>}`. This plays the part of the HTTPS status code. A retried identical response gets the recorded `accepted` again (<<session-state>>).
+|`Seal(header ‖ challenge, result)` with the device-to-wallet context. `result` is `{"result":"accepted"}`, or `{"result":"rejected","error":<code>}`. This plays the part of the HTTPS status code. A retried identical response gets the recorded `accepted` again (<<session-state>>).
 
 |ERROR |Either direction
 |One byte of error code, unencrypted (<<ble-errors>>).
@@ -1603,7 +1608,7 @@ A device or wallet conforms to it only if it meets every requirement below, as w
 |Its deadline `t_hello + W + L`, only ever shortened by `remaining` (<<ble-resume>>). No comparison of the device's timestamps with its own clock.
 
 |Credential validity
-|Records the acceptance level it reached; without trusted current time, at most issuer-attested validity during the session, and only with a response proof (<<offline-validity>>).
+|Records the acceptance level it reached. Without trusted current time it runs in limited validity mode and does not meet G7's temporal-validity requirement; it reaches at most issuer-attested validity during the session, and only with a response proof (<<offline-validity>>).
 |No change.
 
 |Session state
@@ -1624,7 +1629,7 @@ Only the wallet needs the internet, to check the C2PA trust list and to reach th
 
 === What an offline device must be able to do
 
-An offline device MUST be able to run every check of <<device-validation>> with no network access.
+An offline device MUST be able to run every check of <<device-validation>> with no network access, except the comparison of a credential's validity period with the current time when it has no trusted current time. That device runs in limited validity mode (<<offline-validity>>).
 
 Signing the request::
 Needs only the device's C2PA credential. Unchanged.
@@ -1653,6 +1658,8 @@ Over BLE, the time checks of <<ble-time>> depend only on durations, measured sep
 <<device-ica>> compares `validFrom` and `validUntil` with the device's clock.
 A device whose clock is not known to be correct, for example because it has never been set from a trusted source, cannot do that.
 Skipping the comparison changes what the device has established, so this draft names three acceptance levels:
+
+The two lower levels make up _limited validity mode_: they do not meet the temporal-validity part of G7 (<<guarantees>>).
 
 Full acceptance::
 Every check of <<device-ica>>, including that the credential is valid at the device's current time, when it accepts it. Only a device with trusted current time reaches this level. This is G7.
@@ -1716,7 +1723,7 @@ The device persists, so that a power cycle does not lose them:
 * the request bytes it sent, which it needs for the response proof and for check 6 of <<device-validation>>;
 * `t_create`, and enough clock state to measure elapsed time across a power cycle. A device that cannot measure elapsed time reliably after a restart MUST discard its pending sessions;
 * the asset and its unfinished claim, exactly as they were when it computed the `signer_payload`, including the space reserved for the identity assertion;
-* a _finished_ flag, written atomically with accepting a response, together with the recorded outcome and signature digest (<<session-state>>).
+* a _finished_ flag, written atomically with accepting a response, together with the recorded outcome and the SHA-256 of the complete sign response octets (<<session-state>>).
 
 === Completing
 
@@ -2875,6 +2882,12 @@ Redirect handling belongs to the application's HTTP client.
 [appendix]
 [[changelog]]
 == Change log (informative)
+
+0.10-draft::
+* Named _limited validity mode_ for devices without trusted current time, and made G7, the offline rules and the BLE conformance table say that it does not meet G7's temporal-validity requirement.
+* Narrowed G11: each party enforces its own deadline, and the device's is authoritative. Over HTTPS a wallet may act after the device's deadline, and is then rejected. The BLE assumptions are now in G11.
+* Wrote the HPKE calls as `Seal(header, ...)` and `Seal(header ‖ challenge, ...)`, so the challenge is not appended twice.
+* The store-and-forward persistence list now records the SHA-256 of the complete sign response octets, matching the retry rule.
 
 0.9-draft::
 * Split offline acceptance into three levels. The response-proof route now gives "issuer-attested validity during the session", not full acceptance, which needs trusted current time (<<offline-validity>>).
