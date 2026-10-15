@@ -7,7 +7,7 @@
 :sectanchors:
 :icons: font
 :source-highlighter: rouge
-:revnumber: 0.7-draft
+:revnumber: 0.8-draft
 :revdate: 2026-10-14
 :cawg-ia: https://cawg.io/identity/1.3/
 :c2pa-spec: https://c2pa.org/specifications/specifications/2.2/specs/C2PA_Specification.html
@@ -326,7 +326,7 @@ The section references give the binding A rules.
 |G8 |Size |The signature fits `max_signature_size`. All inputs are within the maximums. |<<resource-limits>>
 |G9 |Exact bytes |The `signature` bytes travel unchanged from the signer to the identity assertion. Nobody repairs or rewrites them. |<<_use_of_the_signature>>
 |G10 |Request-to-result proof |When required, the key that made the identity signature also signs a digest of the exact request and a digest of the exact signature bytes. For ICA, the issuer signs only under current actor authorization. |<<response-proof>>
-|G11 |Deadline |One acceptance deadline applies to every party. |<<acceptance-deadline>>
+|G11 |Deadline |Every party acts only before the session's acceptance deadline, as the device measures it. Over HTTPS all parties use the same absolute deadline. Over BLE, and at the issuer, each party uses a deadline derived so that it is never later than the device's. |<<acceptance-deadline>>, <<ble-time>>, <<vci-dataset>>
 |G12 |Fail-closed extensions |A receiver that does not implement a security-relevant requirement rejects the request; it does not ignore the requirement. |<<extensions>>
 |===
 
@@ -1117,6 +1117,7 @@ So an ICA issuer MUST create a response proof only within an issuance transactio
 For example, the actor might sign in again, or confirm on a device the issuer trusts.
 A long-lived token that the wallet holds is not enough.
 The issuer MUST NOT create a proof for a request digest outside such a transaction.
+*(proposed)* The issuer MUST NOT create a proof for a credential that is outside its validity period (`validFrom`, `validUntil`) at the time it creates the proof. A device that cannot check validity against its own clock relies on this (<<offline-validity>>).
 _(`ica_response_proof` signs the digest it is given, so the issuer service must enforce this rule.)_
 
 ==== Validating a proof
@@ -1129,7 +1130,7 @@ A device that requires a proof MUST reject a `signed` response unless all of the
 . `request_digest` equals the SHA-256 that the device computes over its stored request bytes.
 . `signature_digest` equals the SHA-256 that the device computes over the decoded `signature` it received.
 . The protected `alg` equals the identity signature's algorithm.
-. The signature verifies, with external AAD `macawg.sign_response.v1`, under the key that verified the identity signature: the ICA issuer's key, or the key of the X.509 end-entity certificate.
+. The signature verifies, with the external AAD of the binding the request came through (<<proof-domains>>), under the key that verified the identity signature: the ICA issuer's key, or the key of the X.509 end-entity certificate. A validator MUST take the AAD from the binding in use, and MUST NOT accept a proof made with another binding's AAD.
 
 Verifying the proof's signature alone is not enough: checks 3 and 4 bind the proof to this request and to this signature.
 _(Traces to `check_response`, which takes the request envelope the device served, and recomputes both digests. It also requires the payload to be exactly the deterministic encoding of the map.)_
@@ -1234,7 +1235,10 @@ Otherwise anyone who can reach the session URL could close the session by postin
 The wallet MAY retry until the acceptance deadline.
 The device SHOULD rate-limit submissions per session.
 * A valid `declined` response ends the session.
-* The device MUST discard the session once it is finished, or once the acceptance deadline has passed (<<acceptance-deadline>>).
+* When the device accepts a valid response, signed or declined, it MUST record the outcome and the SHA-256 of the response's decoded `signature` (or of the whole response, for `declined`), atomically with marking the session finished.
+* If the wallet sends the same response again, for example because it did not receive the acknowledgement, the device MUST answer with the recorded outcome (HTTP 2xx, or a BLE `RESULT` `accepted`) and MUST NOT apply the signature again.
+A different response for a finished session MUST be rejected with the error `already_finished`.
+* The device MUST keep this finished-session record until the acceptance deadline, and MUST discard the session, including the record, after the deadline (<<acceptance-deadline>>, <<ble-time>>).
 
 [[transport]]
 == Transports for binding A
@@ -1374,14 +1378,14 @@ Each message is a _frame_:
 |===
 
 A frame is sent as a sequence of fragments.
-Each fragment is one characteristic write, or one notification, of at most `ATT_MTU − 3` bytes, the largest value a write request or a notification can carry (<<BT-CORE>> Vol 3, Part F, §3.4.5.1, §3.4.7.1).
+Each fragment is one characteristic write, or one notification, of at most `min(ATT_MTU − 3, 512)` bytes. `ATT_MTU − 3` is the largest value a write request or a notification can carry (<<BT-CORE>> Vol 3, Part F, §3.4.5.1, §3.4.7.1), and 512 octets is the maximum length of an attribute value (Part F, §3.2.9). For example, an `ATT_MTU` of 517 would allow 514 bytes, which exceeds the attribute limit.
 Fragments are the frame's bytes in order, with no header of their own.
 The receiver concatenates fragments until it has read the 6-byte header and then `length` more bytes.
 The next fragment begins the next frame.
 
 * The default LE `ATT_MTU` is 23 (<<BT-CORE>> Vol 3, Part G, §5.2.1), which gives 20-byte fragments. The wallet SHOULD run the Exchange MTU procedure (Part G, §4.3.1) before it writes a `HELLO`; ATT then uses the smaller of the two sides' receive MTUs (Part F, §3.4.2.2).
-* Fragments never exceed `ATT_MTU − 3`, so no fragment needs the long-write procedures, and no value comes near the 512-byte limit on attribute values (Part F, §3.2.9).
-* A receiver MUST check `version`, `type` and `length` as soon as it has the header, and abort if `length` exceeds the frame maximum: 1 MiB plus 48 bytes for REQUEST, 128 KiB plus 16 bytes for RESPONSE, and 4 KiB for the other types (<<resource-limits>>).
+* Because fragments never exceed `ATT_MTU − 3`, no fragment needs the long-write procedures (Part F, §3.2.9).
+* A receiver MUST check `version`, `type` and `length` as soon as it has the header, and abort if `length` exceeds the frame maximum: 1 MiB plus 84 bytes for REQUEST (32 for `enc_d`, 36 for `challenge` and `remaining`, 16 for the tag), 128 KiB plus 16 bytes for RESPONSE, and 4 KiB for the other types (<<resource-limits>>).
 * A receiver MUST abort if more than 30 seconds pass between fragments of one frame. This matches the ATT transaction timeout (Part F, §3.3.3).
 
 Throughput at small MTUs is low, so a device SHOULD keep BLE request envelopes small. In particular, it SHOULD keep any `context.thumbnail` under 16 KiB.
@@ -1432,16 +1436,16 @@ The nonce has only 128 bits, below the 32 bytes of entropy that HPKE's PSK mode 
 |Frame |Direction |`body`
 
 |HELLO |Wallet to device on Key exchange
-|`sid_len` (1 byte), `sid` (ASCII), `enc_w` (32 bytes), and `Seal(aad, pkW)` (48 bytes). The wallet generates a fresh key pair `(skW, pkW)` for each connection, and runs `SetupBaseS(pkD, info_w2d)` to get `enc_w` and its context.
+|`sid_len` (1 byte), `sid` (ASCII), `enc_w` (32 bytes), and `Seal(aad, pkW ‖ flags)` (49 bytes). The wallet generates a fresh key pair `(skW, pkW)` for each connection, and runs `SetupBaseS(pkD, info_w2d)` to get `enc_w` and its context. `flags` is one byte; bit 0, _resume_, is set when the wallet already holds the request (<<ble-resume>>).
 
 |REQUEST |Device to wallet on Request
-|`enc_d` (32 bytes) and `Seal(aad, envelope)`. The device opens the HELLO with `SetupBaseR(enc_w, skD, info_w2d)`, then runs `SetupBaseS(pkW, info_d2w)`. `envelope` is the request envelope JSON, exactly as an HTTPS `GET` would return it.
+|`enc_d` (32 bytes) and `Seal(aad, challenge ‖ remaining ‖ envelope)`. The device opens the HELLO with `SetupBaseR(enc_w, skD, info_w2d)`, then runs `SetupBaseS(pkW, info_d2w)`. `challenge` is 32 bytes from a cryptographically secure random generator, new for every connection (<<ble-replay>>). `remaining` is 4 bytes, big-endian: the whole seconds left until the device's deadline (<<ble-time>>). `envelope` is the request envelope JSON, exactly as an HTTPS `GET` would return it.
 
 |RESPONSE |Wallet to device on Response
-|`Seal(aad, response)` with the wallet-to-device context. `response` is the sign response JSON, exactly as an HTTPS `POST` would carry it.
+|`Seal(aad ‖ challenge, response)` with the wallet-to-device context, where `challenge` is the one in this connection's REQUEST. `response` is the sign response JSON, exactly as an HTTPS `POST` would carry it.
 
 |RESULT |Device to wallet on Request
-|`Seal(aad, result)` with the device-to-wallet context. `result` is `{"result":"accepted"}`, or `{"result":"rejected","error":<code>}`. This plays the part of the HTTPS status code.
+|`Seal(aad ‖ challenge, result)` with the device-to-wallet context. `result` is `{"result":"accepted"}`, or `{"result":"rejected","error":<code>}`. This plays the part of the HTTPS status code. A retried identical response gets the recorded `accepted` again (<<session-state>>).
 
 |ERROR |Either direction
 |One byte of error code, unencrypted (<<ble-errors>>).
@@ -1460,9 +1464,40 @@ A device MAY accept HELLOs from more than one wallet in a session, as an HTTPS d
 Each connection has its own pair of contexts.
 <<session-state>> still allows only one accepted `signed` response.
 
-A wallet MAY disconnect after the REQUEST while the person decides, and reconnect later with a new HELLO and a new `(skW, pkW)`, until the acceptance deadline.
-On every connection the device sends the REQUEST again.
-The wallet MUST check that it is byte-for-byte the envelope it already holds, and abort if not.
+[[ble-replay]]
+==== Replay across connections
+
+HPKE's sequence numbers protect only the messages within one context (<<RFC9180>> §9.7.1, §9.7.3).
+A context is a function of `enc_w`, `skD` and `info_w2d`, and the device keeps `skD`, `sid` and the nonce for the whole session.
+So someone who captured a HELLO can replay it, and the device will derive the same wallet-to-device context, with its sequence number reset to zero.
+Without a further rule, a captured RESPONSE would then open again.
+
+The `challenge` closes this.
+The device generates a new one for every connection, and the wallet must include it in the AAD of its RESPONSE.
+A replayed RESPONSE carries an old challenge, so it fails to open.
+The replayer cannot learn the new challenge, which is sealed to the `pkW` in the replayed HELLO, and cannot make a new RESPONSE, because it does not know the wallet-to-device key.
+
+This is a small addition to HPKE, not a reviewed handshake.
+*(proposed)* Before this transport becomes normative, the design needs cryptographic review.
+A reviewed alternative is the Noise NK pattern, in which the wallet knows the device's static key in advance, with `sid` and the nonce in the prologue.
+
+[[ble-resume]]
+==== Reconnecting
+
+A wallet MAY disconnect after the REQUEST while the person decides, and reconnect later with a new HELLO and a new `(skW, pkW)`, with the resume flag set.
+The device distinguishes the two kinds of HELLO:
+
+Initial delivery (resume flag clear)::
+The device sends the REQUEST only within `W` of creating it (<<ble-time>>). After that it answers with `ERROR` `0x06`.
+
+Retransmission (resume flag set)::
+The device sends the REQUEST again until its deadline, for a normal session or a store-and-forward session.
+The wallet MUST check that the envelope is byte-for-byte the one it already holds, and abort if not.
+A wallet that does not already hold the request MUST NOT set the flag, and MUST reject a retransmitted REQUEST it did not expect.
+
+In both cases the wallet sets its deadline to the earlier of its existing deadline and `t_hello + remaining`, where `t_hello` is its own time when it wrote this connection's HELLO.
+`remaining` can therefore shorten the wallet's deadline, never extend it.
+Only the device can have sealed `remaining`: `pkW` reached it sealed to `pkD`, so nobody else knows the key to seal to.
 
 [[ble-errors]]
 ==== Errors and abort
@@ -1489,7 +1524,7 @@ Binding A over HTTPS relies on TLS to hide the request, which carries the nonce,
 |Response confidentiality |TLS |Sealed to `pkD` from the QR code. Only the device that holds `skD` can open it.
 |Integrity in transit |TLS |The AEAD, as well as the COSE signature on the request and the identity signature in the response.
 |Destination binding (G3) |`session_url` equals `u`; no redirects |`session_key` equals `k` (<<ble-destination>>)
-|Order and replay within a connection |TLS record sequence |HPKE sequence numbers; new contexts on every connection
+|Order and replay |TLS record sequence, and fresh keys per connection |HPKE sequence numbers within a connection; the device's per-connection `challenge` across connections (<<ble-replay>>)
 |Forward secrecy |TLS 1.3 ephemeral key exchange |Both key pairs are ephemeral, and are deleted when the session ends. Store-and-forward keeps `skD` longer (<<store-and-forward>>).
 |Client authentication |None |None. HPKE base mode does not authenticate the sender (<<RFC9180>> Table 6). The wallet is gated only by knowing the invite.
 |===
@@ -1504,15 +1539,55 @@ These rules replace wallet checks 8 and 9 (<<wallet-validation>>) and the accept
 The HTTPS transport keeps the absolute checks, because an HTTPS device is reachable over a network and can usually keep its clock set.
 
 * `W` MUST be greater than 0 and at most 15 minutes (check 19).
-* The device MUST NOT send a REQUEST more than `W` after it created the request, measured on its own clock.
-* The wallet's deadline is `t_receipt + W + L`, where `t_receipt` is the wallet's time when it first received the REQUEST, and `L` is the store-and-forward lifetime, or 0 (<<store-and-forward>>). The wallet MUST NOT send a `signed` response after it.
+* The device MUST NOT make the initial delivery of a REQUEST more than `W` after it created the request, measured on its own clock. Retransmissions follow <<ble-resume>>.
+* The wallet's deadline is `t_hello + W + L`, where `t_hello` is the wallet's time when it wrote the HELLO that led to its first REQUEST, and `L` is the store-and-forward lifetime, or 0 (<<store-and-forward>>). Each later connection may only shorten it (<<ble-resume>>). The wallet MUST NOT send a `signed` response after it.
 * The device's deadline is `t_create + 2W + L + 5 minutes`, on its own clock. The device MUST NOT accept a response after it, and MUST discard the session after it.
 * The device MUST measure these times with a clock that does not jump, such as a monotonic clock, or a real-time clock that is not adjusted during the session.
 
-Because the device sent the REQUEST within `W` of creating it, `t_receipt` is at most `t_create + W`, so the wallet's deadline always comes before the device's, apart from clock-rate drift, which the 5 minutes cover.
-Freshness comes from the nonce: the wallet accepts only a request that carries the nonce from the QR code it just scanned, which nobody could have known before the device made it.
+The wallet writes its HELLO before the device sends the REQUEST, and the device makes the initial delivery within `W` of creating the request.
+So `t_hello` is earlier than `t_create + W`, however long the transfer takes, and the wallet's deadline is earlier than `t_create + 2W + L`.
+The device's deadline adds 5 minutes for the difference in clock rates.
+The wallet and device therefore have different deadlines, but the wallet's is never later than the device's, which is what G11 requires.
+
+The nonce shows that the request was made for the QR code the wallet just scanned: nobody could have known it before the device made it.
+That makes the request fresh. It does not make the returned credential fresh (<<offline-validity>>).
 
 Without store-and-forward, a BLE session can last up to `2W + 5` minutes, at most 35 minutes, compared with 20 minutes over HTTPS.
+
+[[ble-conformance]]
+==== Conformance for the BLE transport *(proposed)*
+
+The BLE transport changes more than the link.
+A device or wallet conforms to it only if it meets every requirement below, as well as binding A.
+
+[cols="2,5,5",options="header"]
+|===
+|Area |Device |Wallet
+
+|Request members
+|Sends `session_key`, lists it in `crit`, and omits `session_url`. Sends `store_and_forward` only for a resumable session, and lists it in `crit`.
+|Checks 22 to 24 of <<wallet-validation>>. Rejects `session_key` that differs from `k`.
+
+|Link
+|The GATT service, framing and fragment limits (<<ble-gatt>>, <<ble-framing>>); the HPKE suite and `info` strings (<<ble-hpke>>); a new `challenge` per connection; `remaining` in every REQUEST.
+|The same framing and HPKE; the `challenge` in the RESPONSE AAD; the resume flag only when it holds the request.
+
+|Time
+|Initial delivery within `W`; its deadline `t_create + 2W + L + 5 minutes` on a clock that does not jump (<<ble-time>>).
+|Its deadline `t_hello + W + L`, only ever shortened by `remaining` (<<ble-resume>>). No comparison of the device's timestamps with its own clock.
+
+|Credential validity
+|Records the acceptance level it reached; without a trusted clock, full acceptance only with a response proof (<<offline-validity>>).
+|No change.
+
+|Session state
+|One accepted response; the recorded outcome for an identical retry; `already_finished` for a different one; nothing ends a session on an unauthenticated `ERROR` (<<session-state>>, <<ble-errors>>).
+|Retries the same response after a lost RESULT.
+
+|Persistence (store-and-forward only)
+|The state listed in <<store-and-forward>>, kept across power cycles, with the finished record written atomically.
+|The stored request and approval, protected at rest; no stored `skW`.
+|===
 
 [[offline]]
 == Offline devices *(proposed)*
@@ -1546,16 +1621,36 @@ Use only keys the device already has: the issuer key above, or the X.509 certifi
 An offline device's clock may be unset, or may drift.
 Over BLE, the time checks of <<ble-time>> depend only on durations, measured separately on each side.
 
-The ICA validity check needs one more rule.
+[[offline-validity]]
+==== Credential validity without a trusted clock
+
 <<device-ica>> compares `validFrom` and `validUntil` with the device's clock.
-A device whose clock is not known to be correct, for example because it has never been set from a trusted source:
+A device whose clock is not known to be correct, for example because it has never been set from a trusted source, cannot do that.
+Skipping the comparison changes what the device has established, so this draft names two acceptance levels:
 
-* MUST NOT reject a credential because `validFrom` is later than its clock, or because `validUntil` is earlier;
-* MUST still require `validFrom` to be present, and `validUntil`, if present, to be later than `validFrom`.
+Full acceptance::
+Every check of <<device-ica>>, including temporal validity, has been established. This is G7.
 
-Freshness then comes from the nonce and, when required, the response proof.
-Validators of the asset still check the credential's validity period (<<CAWG-IA>> §8.1.5.2.6).
-_(Not implemented: the reference implementation always compares `validFrom` and `validUntil` with its clock.)_
+Signature verified, temporal validity unchecked::
+Every check except the comparison of `validFrom` and `validUntil` with the current time.
+G7 is not fully met.
+
+*(proposed)* A device without a trusted clock:
+
+* MUST NOT claim full acceptance on its own, and MUST record which level it reached;
+* MUST still require `validFrom` to be present, and `validUntil`, if present, to be later than `validFrom`;
+* to reach full acceptance, MUST set `response_proof_required`. The issuer then creates the proof only while the credential is valid (<<_producing_a_proof_for_ica>>). The proof covers this request's digest, so it was made after the request existed and before the device accepted it. The credential was therefore valid, by the issuer's clock, at a time within the session. The device trusts the issuer for G7 in any case;
+* without a proof, MUST treat the acceptance as "temporal validity unchecked".
+
+The nonce does not help here. It is not in the ICA credential, so without a proof an older credential for the same `signer_payload` could be reused.
+Nor does a proof establish the device's current time: it only places a valid credential within the session.
+
+In X.509 mode, a device without a trusted clock cannot check the certificate's validity period.
+The acceptance is "temporal validity unchecked" unless the device has a trusted time source.
+
+Validators of the asset check the credential's validity later (<<CAWG-IA>> §8.1.5.2.6), but that does not perform the device's check retroactively.
+A device whose policy requires full validity before it publishes MUST have trusted time: a clock set from an authenticated source, or the response-proof route above.
+_(Not implemented: the reference implementation always compares `validFrom` and `validUntil` with its clock, and has no acceptance levels.)_
 
 [[store-and-forward]]
 == Store-and-forward *(proposed)*
@@ -1583,7 +1678,7 @@ The wallet:
 
 . validates the request as usual, except that it cannot check the C2PA trust list online. It MUST use a cached trust list, and MUST NOT treat the requester as trusted if its cached list is older than its policy allows;
 . shows the person the request and the identities, and that the signature will be completed later, and obtains their approval (G6);
-. stores the request envelope bytes, the invite's `sid`, `n`, `svc` and `k`, `t_receipt`, and the person's approved selection, protected at rest;
+. stores the request envelope bytes, the invite's `sid`, `n`, `svc` and `k`, its current deadline (<<ble-resume>>), and the person's approved selection, protected at rest;
 . does not store `skW`. Each later connection uses a new key pair.
 
 The device persists, so that a power cycle does not lose them:
@@ -1592,7 +1687,7 @@ The device persists, so that a power cycle does not lose them:
 * the request bytes it sent, which it needs for the response proof and for check 6 of <<device-validation>>;
 * `t_create`, and enough clock state to measure elapsed time across a power cycle. A device that cannot measure elapsed time reliably after a restart MUST discard its pending sessions;
 * the asset and its unfinished claim, exactly as they were when it computed the `signer_payload`, including the space reserved for the identity assertion;
-* a _finished_ flag, written atomically with accepting a response.
+* a _finished_ flag, written atomically with accepting a response, together with the recorded outcome and signature digest (<<session-state>>).
 
 === Completing
 
@@ -1603,17 +1698,19 @@ The wallet SHOULD remind the person what they approved before it starts issuance
 
 The wallet then reconnects:
 
-. It scans for `svc`, connects, and writes a HELLO with the stored `sid` and a new `(skW, pkW)`.
+. It scans for `svc`, connects, and writes a HELLO with the stored `sid`, a new `(skW, pkW)`, and the resume flag set.
 . The device finds the session by `sid`, and opens the HELLO with the stored `skD` and nonce.
-. The device sends the REQUEST again. The wallet MUST check that it equals the stored bytes, which shows it has reached the same session.
+. The device retransmits the REQUEST, with a new `challenge` and its `remaining` time (<<ble-resume>>). The wallet MUST check that the envelope equals the stored bytes, which shows it has reached the same session, and shortens its deadline if `remaining` requires it.
 . The wallet sends the RESPONSE, and the device answers with a RESULT.
+If the RESULT is lost, the wallet reconnects and sends the same RESPONSE again, and gets the recorded outcome (<<session-state>>).
 
 The device SHOULD advertise `svc` while it has pending sessions, and MAY require a user action to start advertising, to save power.
 
 === Rejecting a reply the device can no longer use
 
 If the device still holds `skD` for the session, but can no longer use a signature, it MUST answer the RESPONSE with a sealed RESULT `{"result":"rejected","error":"session_unusable"}`.
-For example, the asset or claim was deleted or changed, or the session expired or finished.
+For example, the asset or claim was deleted or changed.
+A finished session is different: it answers an identical response with the recorded outcome, and a different one with `already_finished` (<<session-state>>).
 Because the RESULT is sealed, the wallet can trust it, and MUST then delete its stored state.
 
 A device that no longer holds the session cannot open the HELLO.
@@ -1626,8 +1723,9 @@ A device SHOULD keep `sid`, the nonce and `skD` until its deadline, even after i
 
 Replay::
 The device accepts at most one `signed` response per session, and the persisted finished flag makes this survive restarts.
-A captured RESPONSE cannot be replayed on another connection, because every connection uses new HPKE contexts.
-A replayed HELLO gets the replayer nothing: the device seals the REQUEST to the `pkW` inside it, which the replayer cannot open.
+A replayed HELLO recreates the same wallet-to-device context, so on its own it would let a captured RESPONSE open again.
+The per-connection `challenge` in the RESPONSE's AAD prevents this (<<ble-replay>>).
+The replayer also learns nothing from the REQUEST, which is sealed to the `pkW` inside the replayed HELLO.
 Reuse of an older identity signature for the same `signer_payload` is covered by the response proof, as in every binding (G10). Devices SHOULD set `response_proof_required` for resumable sessions.
 
 Lost session::
@@ -1716,9 +1814,10 @@ The device trusts ICA issuers by DID (`accepted_issuers`).
 This binding connects the two without adding a new device-side trust input:
 
 . The wallet chooses an issuer endpoint whose `macawg_issuer_did` is in `accepted_issuers`, or is allowed by the wallet's issuer policy when `accepted_issuers` is empty.
-. Unless the metadata is signed (<<OpenID4VCI>> §12.2.3), `macawg_issuer_did` is only a routing hint, protected by TLS.
-. The binding is the credential's signed `issuer`. Before release, the wallet MUST check that `issuer` equals the advertised `macawg_issuer_did`, and that it is accepted (<<wallet-release>>).
-. For `did:web`, the DID's host SHOULD equal the host of the Credential Issuer Identifier. A wallet SHOULD refuse an issuer where they differ, unless its policy names that pairing.
+. Before it sends any part of the dataset, which contains the identity values, the wallet MUST establish that the endpoint is controlled by that DID:
+.. for `did:web`, the host of the Credential Issuer Identifier MUST equal the DID's host, and the wallet relies on TLS to that host, which is also where the DID document is published;
+.. for `did:jwk` or another method, the issuer metadata MUST be signed (<<OpenID4VCI>> §12.2.3) with a key of that DID, or the wallet MUST have the pairing of DID and Credential Issuer Identifier configured in advance.
+. After issuance, the wallet MUST still check that the credential's signed `issuer` equals `macawg_issuer_did`, and that it is accepted (<<wallet-release>>).
 
 The device's checks are unchanged: it checks the DID and the signature (<<device-ica>>), and never needs the issuer's URL.
 
@@ -1735,22 +1834,30 @@ That fails open, breaking G4, G5 and G12.
 The inputs would also arrive only after authorization, so the actor's consent would not cover them.
 
 A dataset prepared before authorization (chosen)::
-The wallet puts the inputs in an `authorization_details` object of type `openid_credential` (<<OpenID4VCI>> §5.1.1, <<RFC9396>>).
-<<OpenID4VCI>> §5.1.1 lets additional fields be defined for this type.
-<<RFC9396>> §5 requires the Authorization Server to reject an object of a known type that has unknown fields, with `invalid_authorization_details`.
-So an issuer that does not implement Macawg fails closed.
+The wallet puts the inputs in a separate `authorization_details` object of a new type, `macawg_ica_dataset`, next to the usual `openid_credential` object.
+<<OpenID4VCI>> §5.1.1 allows `openid_credential` to be combined with other types in one request.
+An earlier draft put the inputs inside the `openid_credential` object, but that fails open: <<OpenID4VCI>> §5.1.1 says that type "is never considered invalid due to unknown fields".
+A new type does fail closed: <<RFC9396>> §5 requires the Authorization Server to refuse any unknown authorization details type, with `invalid_authorization_details`.
 The Authorization Server shows the dataset to the actor before consent.
-It returns the granted `authorization_details` in the Token Response (<<RFC9396>> §7), with `credential_identifiers` (<<OpenID4VCI>> §6.2).
-The Credential Request then names a `credential_identifier`, so the issuer issues exactly the authorized dataset.
+It returns the granted `authorization_details` in the Token Response (<<RFC9396>> §7), with `credential_identifiers` in the `openid_credential` object (<<OpenID4VCI>> §6.2).
+The Credential Request then names a `credential_identifier`, and the issuer issues exactly the dataset authorized in the same grant.
 
-==== The `authorization_details` object *(proposed)*
+==== The `authorization_details` objects *(proposed)*
+
+The request carries two objects.
+
+The `openid_credential` object has `type` `openid_credential`, a `credential_configuration_id` whose `format` is `macawg_ica_cose`, and, because the issuer metadata has `authorization_servers`, `locations` set to the Credential Issuer Identifier (<<OpenID4VCI>> §5.1.1). It carries no Macawg members.
+
+The `macawg_ica_dataset` object:
 
 [cols="2,1,4",options="header"]
 |===
 |Member |Presence |Meaning
 
-|`type` |REQUIRED |`openid_credential`.
-|`credential_configuration_id` |REQUIRED |A configuration whose `format` is `macawg_ica_cose`.
+|`type` |REQUIRED |`macawg_ica_dataset`.
+|`locations` |REQUIRED |The Credential Issuer Identifier, as in the `openid_credential` object.
+|`credential_configuration_id` |REQUIRED |The same configuration as the `openid_credential` object, linking the two.
+|`macawg_not_after` |REQUIRED |The wallet's deadline for the session, as an absolute UTC timestamp from the wallet's clock (<<ble-time>>, <<acceptance-deadline>>). The issuer MUST refuse authorization, issuance and proof creation after it.
 |`macawg_signer_payload` |REQUIRED |The device's `signer_payload`, in the JSON form of <<wire-signer-payload>>, unchanged.
 |`macawg_verified_identities` |REQUIRED |The `verifiedIdentities` entries the person approved, with their exact values.
 |`macawg_max_signature_size` |REQUIRED |The device's `max_signature_size`.
@@ -1768,6 +1875,13 @@ Example, as pushed with PAR:
   {
     "type": "openid_credential",
     "credential_configuration_id": "cawg_ica",
+    "locations": ["https://ica.example"]
+  },
+  {
+    "type": "macawg_ica_dataset",
+    "locations": ["https://ica.example"],
+    "credential_configuration_id": "cawg_ica",
+    "macawg_not_after": "2026-10-14T09:40:00Z",
     "macawg_signer_payload": {
       "referenced_assertions": [
         { "url": "self#jumbf=c2pa.assertions/c2pa.hash.data", "alg": "sha256", "hash": "gZXc8AkKv86pivdlRBEH0f__JnJJGh5EpjvAZZ-tUcU" }
@@ -1801,19 +1915,20 @@ Example, as pushed with PAR:
 PAR is REQUIRED in this binding, because the dataset is too large for a URL.
 The pre-authorized code flow MUST NOT be used, because the issuer could not then obtain the actor's current authorization for this dataset.
 . The Authorization Server:
-.. MUST reject the request if any member is unknown, or if `macawg_accepted_issuers` is non-empty and does not contain its DID;
+.. MUST reject the request if it does not support `macawg_ica_dataset`, which <<RFC9396>> §5 already requires, if the object has an unknown member, if `macawg_accepted_issuers` is non-empty and does not contain its DID, or if its time is later than `macawg_not_after`;
 .. MUST authenticate the named actor in this authorization transaction when `macawg_response_proof` is present, and SHOULD do so otherwise. Reusing an earlier session without the actor's action is not enough when a proof is required;
 .. MUST check every entry of `macawg_verified_identities` against what the issuer has verified for this actor, and refuse if any differs;
 .. MUST show the actor the identity values and the fact that they will be published in an asset, and obtain consent.
-. The Token Response MUST return `authorization_details` identical to the pushed object, with `credential_identifiers`.
+. The Token Response MUST return a `macawg_ica_dataset` object identical to the pushed one, and the `openid_credential` object with `credential_identifiers`.
 The Authorization Server MUST NOT narrow or change the dataset, because a changed dataset would not be what the person approved in the wallet.
-The wallet MUST compare the returned object with the one it pushed, and stop if they differ.
+The wallet MUST compare the returned `macawg_ica_dataset` object with the one it pushed, and stop if it is missing or differs. (<<OpenID4VCI>> §6.2 tells the wallet to ignore unknown fields in the `openid_credential` object, which is why the dataset is not there.)
 . The wallet sends a Credential Request with `credential_identifier`, and no other Macawg parameters.
 . The Credential Issuer:
 .. MUST issue exactly one credential that meets <<ica-vc>>, <<ica-properties>> and <<ica-cose-profile>>, with `c2paAsset` equal to `macawg_signer_payload` and `verifiedIdentities` equal to `macawg_verified_identities`;
 .. MUST refuse if the credential is longer than `macawg_max_signature_size`;
 .. if `macawg_response_proof` is present, MUST return a response proof (<<response-proof>>) over the given `request_digest` and the issued credential's bytes, with the given `aad`, in the Credential Response parameter `macawg_response_proof` (base64url). <<OpenID4VCI>> §8.3 allows additional Credential Response parameters.
 The issuer MUST create the proof only within this authorized transaction;
+.. MUST refuse issuance and proof creation after `macawg_not_after`;
 .. MUST NOT use deferred issuance (<<OpenID4VCI>> §9), because the acceptance deadline is short.
 . The wallet decodes the credential and runs the checks of <<wallet-release>>, including the issuer check above.
 If a proof is required, the wallet MUST also verify it as the device would (<<_validating_a_proof>>), using the request representation it holds.
@@ -1921,8 +2036,9 @@ The response proof links the two.
 
 The DCQL query (<<OpenID4VP>> §6) has one Credential Query with `id` `cawg`.
 In ICA mode its `format` is `macawg_ica_cose`; in X.509 mode it is the CSC X.509 format.
-The ICA mode query states that no Holder Binding proof is expected.
-<<OpenID4VP>> §8.6 allows a request to waive Holder Binding; the exact DCQL parameter for this is not verified in this draft.
+The ICA mode query sets `require_cryptographic_holder_binding` to `false` (<<OpenID4VP>> §6.1).
+Because the request then asks for a presentation without Holder Binding, `state` is REQUIRED, and MUST be a cryptographically strong random value with at least 128 bits of entropy (<<OpenID4VP>> §5.3).
+Without a key binding proof the response does not return `nonce` (§5.3), so the device correlates the response by `state`, and the response proof binds it to the Request Object, which contains the nonce.
 
 The `vp_token` is `{ "cawg": [ <presentation> ] }` (<<OpenID4VP>> §8.1).
 
@@ -2032,9 +2148,10 @@ The RSSP authorizes signing for specific digests: `credentials/authorize` takes 
 
 ==== Response proofs with a remote key
 
-A response proof's `ToBeSigned` includes the digest of the identity signature, which exists only after the first `signHash` call.
-Because authorization binds digests in advance, the proof needs a second authorization, which normally means a second user action, unless the RSSP authorizes two signatures without fixed digests.
-This is an open issue for binding D: requiring a proof with a remote key costs a second approval.
+A response proof's `ToBeSigned` includes the digest of the identity signature, which exists only after the first `signHash` call, so its digest cannot be authorized in advance.
+<<CSC-API>> §11.9, `credentials/extendTransaction`, covers this case: in a multi-signature transaction authorized with `numSignatures`, it obtains a new SAD for hashes "that were not available when the credential authorization event occurred", within the same authorization event.
+So the wallet SHOULD authorize the credential with `numSignatures` 2, sign the identity `ToBeSigned`, then call `credentials/extendTransaction` with the proof's digest, and sign that.
+Whether the RSSP asks the person to approve again is up to the provider. Some will, so a proof with a remote key may still cost a second approval.
 
 ==== Certificate trust
 
@@ -2388,7 +2505,7 @@ The last column says whether binding A's wire representation stays unchanged if 
 |Yes
 
 |G12 Fail-closed requirements
-|Unknown transaction data types rejected, <<OpenID4VP>> §5.1. Unknown `authorization_details` fields rejected, <<RFC9396>> §5. Unknown request parameters ignored (OAuth); unknown Credential Request and Response parameters ignored, <<OpenID4VCI>> §8.2, §8.3
+|Unknown transaction data types rejected, <<OpenID4VP>> §5.1. Unknown `authorization_details` types rejected, <<RFC9396>> §5, but unknown fields in `openid_credential` tolerated, <<OpenID4VCI>> §5.1.1. Unknown request parameters ignored (OAuth); unknown Credential Request and Response parameters ignored, <<OpenID4VCI>> §8.2, §8.3
 |Extension, placed only inside fail-closed containers
 |None.
 |Yes
@@ -2539,7 +2656,8 @@ The `macawg_` names are placeholders: the namespace (a CAWG-registered URI, or a
 |`macawg.sign_response.oid4vp.v1` |COSE external AAD, response proof |Binding C, and binding B under C |Proposed
 |`macawg_ica_cose` |Credential format identifier |OpenID4VCI `format`; OpenID4VP DCQL `format` and `vp_formats_supported` |Proposed
 |`macawg_issuer_did` |Credential configuration metadata member |OpenID4VCI issuer metadata |Proposed
-|`macawg_signer_payload`, `macawg_verified_identities`, `macawg_max_signature_size`, `macawg_accepted_issuers`, `macawg_response_proof` |`authorization_details` members for type `openid_credential` |OpenID4VCI PAR and Token Response |Proposed
+|`macawg_ica_dataset` |`authorization_details` type |OpenID4VCI PAR and Token Response |Proposed
+|`macawg_not_after`, `macawg_signer_payload`, `macawg_verified_identities`, `macawg_max_signature_size`, `macawg_accepted_issuers`, `macawg_response_proof` |Members of `macawg_ica_dataset` |OpenID4VCI PAR and Token Response |Proposed
 |`macawg_response_proof` |Credential Response parameter |OpenID4VCI Credential Response |Proposed
 |`macawg_cawg_sign` |Transaction data type, with members `signer_payload`, `max_signature_size`, `requested`, `context` |OpenID4VP `transaction_data` |Proposed
 |`{ "signature", "response_proof" }` |Presentation structure for `macawg_ica_cose` |OpenID4VP `vp_token` |Proposed
@@ -2550,7 +2668,8 @@ The `macawg_` names are placeholders: the namespace (a CAWG-registered URI, or a
 |`6d616361-7767-4001-8000-000000000001` to `…0003` |GATT characteristic UUIDs (placeholders) |BLE transport |Proposed
 |Frame types `0x01` to `0x04`, `0x7F`; error codes `0x01` to `0x06` |Frame format |BLE transport |Proposed
 |`macawg.ble.v1 wallet-to-device`, `macawg.ble.v1 device-to-wallet` |HPKE `info` prefixes |BLE transport |Proposed
-|`{"result": ...}`, `session_unusable` |RESULT body, error code |BLE transport and store-and-forward |Proposed
+|`{"result": ...}`, `session_unusable`, `already_finished` |RESULT body, error codes |BLE transport, store-and-forward, and session state |Proposed
+|HELLO `flags` bit 0 (resume); REQUEST `challenge` and `remaining` |Frame fields |BLE transport |Proposed
 |===
 
 [appendix]
@@ -2564,8 +2683,9 @@ With G2 withdrawn, nothing in the normative binding is waiting on c2pa-rs.
 
 Proposed, and the next candidates for normative status::
 The BLE transport with HPKE, because it covers the main offline case: an offline camera with an online phone.
-It changes no message, only the link, so the validation rules and guarantees carry over.
-It should become normative after two independent implementations pass the BLE test vectors in <<impl-tasks>>.
+It is not only a new link: it adds request members (`session_key`, `store_and_forward`), changes the time semantics, adds a credential-validity policy for devices without a trusted clock, and needs session persistence.
+Each of these has its own conformance requirements (<<ble-conformance>>).
+It should become normative only after cryptographic review of the handshake (<<ble-replay>>), and after two independent implementations pass the BLE test vectors in <<impl-tasks>>, including the replay and resumption cases.
 +
 Binding B, OpenID4VCI issuance of ICA credentials.
 It uses standard mechanisms with fail-closed extension points, preserves every guarantee, and needs no new credential or key.
@@ -2604,7 +2724,9 @@ Rejection cases: an unknown member in the entry; a `response_uri` on a different
 . *BLE transport.*
 A GATT server on a device and a client in the wallet; framing; HPKE with the fixed suite; `k` and `session_key`; the relative time checks; the offline issuer-key and validity rules.
 Vectors, made deterministic with HPKE `DeriveKeyPair` from fixed seeds (<<RFC9180>> §7.1.3): `skD`, `pkD`, `skW`, `pkW` and the ephemeral keys; `info_w2d` and `info_d2w` for the example `sid` and nonce; the HELLO, REQUEST, RESPONSE and RESULT frames for the binding A example messages; the same frames fragmented at `ATT_MTU` 23 and 247.
-Rejection cases: a HELLO sealed with the wrong nonce; a `session_key` that differs from `k`; a RESPONSE replayed on a new connection; a frame whose `length` is too large; a truncated fragment stream; an unauthenticated `ERROR` that must not end the session; a resent REQUEST that differs from the stored one.
+Rejection cases: a HELLO sealed with the wrong nonce; a `session_key` that differs from `k`; a captured HELLO replayed together with its captured RESPONSE, which must fail at the RESPONSE; a RESPONSE whose AAD carries another connection's `challenge`; a frame whose `length` is too large; a fragment longer than 512 bytes at an `ATT_MTU` of 517; a truncated fragment stream; an unauthenticated `ERROR` that must not end the session; a retransmitted REQUEST that differs from the stored one; an initial-delivery HELLO after `W`; a `remaining` that would extend the wallet's deadline, which must be ignored.
+Lost acknowledgement: an identical RESPONSE after the session finished gets `accepted` again, and is not applied twice; a different one gets `already_finished`.
+Offline validity: a device without a trusted clock records "temporal validity unchecked" without a proof, and reaches full acceptance only with one.
 . *Store-and-forward.*
 Persistent device state, a resumption after a power cycle, a `session_unusable` rejection, and a duplicate RESPONSE after the session finished.
 . *Namespace.* Decide who owns the `macawg_` identifiers, and register or rename them.
@@ -2676,7 +2798,9 @@ A helper being available does not mean that a given wallet or device calls it.
 |BLE transport: GATT service, framing, HPKE, `k`, `session_key` |Not implemented |`TransportHint::Ble` parses `svc` and `name` only
 |Relative time checks over BLE |Not implemented |The absolute checks always apply
 |Offline issuer keys |Helper |`DidJwkResolver` for `did:jwk`; provisioned keys through `IssuerKeyResolver`
-|Untrusted-clock ICA validity rule |Not implemented |`verify_ica_credential` always compares `validFrom` and `validUntil` with the clock
+|Untrusted-clock acceptance levels |Not implemented |`verify_ica_credential` always compares `validFrom` and `validUntil` with the clock
+|Idempotent outcome for a retried response |Application |The device's session store
+|Binding B `macawg_ica_dataset` type, `locations`, `macawg_not_after` |Not implemented |—
 |Store-and-forward |Not implemented |—
 |Proof AAD `macawg.sign_response.oid4vp.v1` |Not implemented |—; `tests/vectors.rs` checks that a proof made with it does not verify under binding A
 |Binding A test vectors (<<impl-tasks>> item 1) |Library |`tests/vectors.rs`
@@ -2716,6 +2840,18 @@ Redirect handling belongs to the application's HTTP client.
 [appendix]
 [[changelog]]
 == Change log (informative)
+
+0.8-draft::
+* BLE: added a per-connection device `challenge` in the RESPONSE and RESULT AAD, because a replayed HELLO recreates the wallet-to-device context (<<ble-replay>>). Flagged the handshake for cryptographic review.
+* BLE: separated initial delivery from retransmission with a resume flag, and added an authenticated `remaining` time that can only shorten the wallet's deadline (<<ble-resume>>). The wallet's deadline now starts when it writes the HELLO, so delivery delay cannot push it past the device's. Reworded G11.
+* Capped fragments at `min(ATT_MTU − 3, 512)`.
+* Offline devices: named two acceptance levels, and made full acceptance without a trusted clock depend on a response proof, which the issuer creates only while the credential is valid (<<offline-validity>>).
+* Session state: a retried identical response gets the recorded outcome, and a different one `already_finished`.
+* Binding B: moved the dataset to a new `authorization_details` type, `macawg_ica_dataset`, because `openid_credential` tolerates unknown fields; added `locations` and `macawg_not_after`; required the wallet to authenticate the issuer endpoint before sending the dataset.
+* Binding C: specified `require_cryptographic_holder_binding` `false` and the `state` requirement.
+* Binding D: described `credentials/extendTransaction`, so a second approval is provider-dependent.
+* Response proof validation takes the AAD from the binding in use.
+* Removed the claim that BLE changes only the link, and added conformance requirements (<<ble-conformance>>).
 
 0.7-draft::
 * Replaced the BLE placeholder with a proposed BLE transport for binding A: a GATT service, framing and fragmentation, and HPKE (X25519, HKDF-SHA256, ChaCha20-Poly1305) keyed from a new invite parameter `k` (<<transport-ble>>).
